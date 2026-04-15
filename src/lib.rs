@@ -6,6 +6,7 @@ pub mod regalloc;
 pub use ir::{
     BasicBlock, BlockId, Function, FunctionParam, IcmpPredicate, InstrId, Instruction,
     IrBuildError, IrBuilder, PhiIncoming, Type, ValueData, ValueId, ValueKind, build_factorial_il,
+    constant_fold, dead_code_elimination, run_phase5_pipeline, simplify_cfg,
 };
 pub use lowering::{LoweringError, PhiCopy, PhiElimination, eliminate_phi_nodes, lower_il_to_mir};
 pub use mir::{

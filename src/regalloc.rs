@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -77,16 +77,65 @@ struct ResolvedOperand {
 }
 
 pub fn compute_live_intervals(func: &MirFunction) -> Vec<LiveInterval> {
-    let mut ranges: HashMap<usize, (usize, usize)> = HashMap::new();
+    if func.instructions.is_empty() {
+        return Vec::new();
+    }
 
+    let mut label_to_index = HashMap::new();
     for (index, inst) in func.instructions.iter().enumerate() {
-        let mut uses = Vec::new();
-        let mut defs = Vec::new();
-        collect_vreg_uses(inst, &mut uses);
-        collect_vreg_defs(inst, &mut defs);
+        if let MirInst::Label(label) = inst {
+            label_to_index.insert(label.clone(), index);
+        }
+    }
 
-        for vreg in uses.into_iter().chain(defs) {
-            let entry = ranges.entry(vreg).or_insert((index, index));
+    let mut uses = vec![Vec::new(); func.instructions.len()];
+    let mut defs = vec![Vec::new(); func.instructions.len()];
+    for (index, inst) in func.instructions.iter().enumerate() {
+        collect_vreg_uses(inst, &mut uses[index]);
+        collect_vreg_defs(inst, &mut defs[index]);
+    }
+
+    let mut live_in: Vec<HashSet<usize>> = vec![HashSet::new(); func.instructions.len()];
+    let mut live_out: Vec<HashSet<usize>> = vec![HashSet::new(); func.instructions.len()];
+
+    loop {
+        let mut changed = false;
+
+        for index in (0..func.instructions.len()).rev() {
+            let mut next_out = HashSet::new();
+            for succ in instruction_successors(index, &func.instructions, &label_to_index) {
+                next_out.extend(live_in[succ].iter().copied());
+            }
+
+            let mut next_in = next_out.clone();
+            for def in &defs[index] {
+                next_in.remove(def);
+            }
+            for used in &uses[index] {
+                next_in.insert(*used);
+            }
+
+            if next_in != live_in[index] || next_out != live_out[index] {
+                live_in[index] = next_in;
+                live_out[index] = next_out;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    let mut ranges: HashMap<usize, (usize, usize)> = HashMap::new();
+    for index in 0..func.instructions.len() {
+        for vreg in live_in[index]
+            .iter()
+            .chain(live_out[index].iter())
+            .chain(uses[index].iter())
+            .chain(defs[index].iter())
+        {
+            let entry = ranges.entry(*vreg).or_insert((index, index));
             entry.0 = entry.0.min(index);
             entry.1 = entry.1.max(index);
         }
@@ -98,6 +147,34 @@ pub fn compute_live_intervals(func: &MirFunction) -> Vec<LiveInterval> {
         .collect();
     intervals.sort_by_key(|interval| (interval.start, interval.vreg));
     intervals
+}
+
+fn instruction_successors(
+    index: usize,
+    instructions: &[MirInst],
+    label_to_index: &HashMap<String, usize>,
+) -> Vec<usize> {
+    match &instructions[index] {
+        MirInst::Ret => Vec::new(),
+        MirInst::Jmp { label } => label_to_index.get(label).copied().into_iter().collect(),
+        MirInst::JmpIf { label, .. } => {
+            let mut succ = Vec::new();
+            if let Some(target) = label_to_index.get(label) {
+                succ.push(*target);
+            }
+            if index + 1 < instructions.len() {
+                succ.push(index + 1);
+            }
+            succ
+        }
+        _ => {
+            if index + 1 < instructions.len() {
+                vec![index + 1]
+            } else {
+                Vec::new()
+            }
+        }
+    }
 }
 
 pub fn linear_scan_allocate(
@@ -116,11 +193,12 @@ pub fn linear_scan_allocate(
 fn linear_scan_allocate_x86_64(func: &MirFunction) -> Result<LinearScanAllocation, AllocError> {
     let intervals = compute_live_intervals(func);
     let allocatable = allocatable_x86_64_registers();
+    let preexisting_stack = max_preexisting_stack_offset(func);
 
     let mut working: HashMap<usize, WorkingAlloc> = HashMap::new();
     let mut active: Vec<ActiveInterval> = Vec::new();
     let mut free_regs = allocatable.to_vec();
-    let mut next_stack_offset: i32 = 0;
+    let mut next_stack_offset: i32 = preexisting_stack;
 
     for interval in &intervals {
         expire_old_intervals(interval.start, &mut active, &mut free_regs, allocatable);
@@ -195,10 +273,12 @@ fn linear_scan_allocate_x86_64(func: &MirFunction) -> Result<LinearScanAllocatio
         }
     }
 
+    let callee_saved = collect_used_callee_saved_registers(&working);
     let raw_stack_size = next_stack_offset.max(0) as usize;
-    let stack_size = align_to_16(raw_stack_size);
+    let stack_size = align_stack_size_for_calls(raw_stack_size, callee_saved.len());
 
-    let lowered = rewrite_with_allocations_x86_64(func, &intervals, &working, stack_size)?;
+    let lowered =
+        rewrite_with_allocations_x86_64(func, &intervals, &working, stack_size, &callee_saved)?;
     let allocated_func = MirFunction::with_instructions(func.name.clone(), lowered);
 
     let mut allocations = BTreeMap::new();
@@ -225,12 +305,18 @@ fn rewrite_with_allocations_x86_64(
     intervals: &[LiveInterval],
     allocations: &HashMap<usize, WorkingAlloc>,
     stack_size: usize,
+    callee_saved: &[PhysReg],
 ) -> Result<Vec<MirInst>, AllocError> {
     let mut out = Vec::new();
 
     out.push(MirInst::Push {
         src: Reg::Phys(PhysReg::RBP),
     });
+    for reg in callee_saved {
+        out.push(MirInst::Push {
+            src: Reg::Phys(*reg),
+        });
+    }
     out.push(MirInst::Mov {
         dst: Reg::Phys(PhysReg::RBP),
         src: Operand::Reg(Reg::Phys(PhysReg::RSP)),
@@ -267,6 +353,15 @@ fn rewrite_with_allocations_x86_64(
                     allocations,
                 )?);
             }
+            MirInst::And { dst, lhs, rhs } => {
+                out.extend(lower_arithmetic_x86_64(
+                    ArithOp::And,
+                    *dst,
+                    *lhs,
+                    rhs,
+                    allocations,
+                )?);
+            }
             MirInst::Mul { dst, lhs, rhs } => {
                 out.extend(lower_arithmetic_x86_64(
                     ArithOp::Mul,
@@ -276,8 +371,23 @@ fn rewrite_with_allocations_x86_64(
                     allocations,
                 )?);
             }
+            MirInst::Sdiv { dst, lhs, rhs } => {
+                out.extend(lower_arithmetic_x86_64(
+                    ArithOp::Sdiv,
+                    *dst,
+                    *lhs,
+                    rhs,
+                    allocations,
+                )?);
+            }
             MirInst::Cmp { lhs, rhs } => {
                 out.extend(lower_cmp_x86_64(*lhs, rhs, allocations)?);
+            }
+            MirInst::LoadStack { dst, offset } => {
+                out.extend(lower_load_stack_x86_64(*dst, *offset, allocations)?);
+            }
+            MirInst::StoreStack { src, offset } => {
+                out.extend(lower_store_stack_x86_64(*src, *offset, allocations)?);
             }
             MirInst::Jmp { label } => out.push(MirInst::Jmp {
                 label: label.clone(),
@@ -325,19 +435,24 @@ fn rewrite_with_allocations_x86_64(
                 }
             }
             MirInst::Ret => {
-                out.push(MirInst::Mov {
-                    dst: Reg::Phys(PhysReg::RSP),
-                    src: Operand::Reg(Reg::Phys(PhysReg::RBP)),
-                });
+                if stack_size > 0 {
+                    out.push(MirInst::Add {
+                        dst: Reg::Phys(PhysReg::RSP),
+                        lhs: Reg::Phys(PhysReg::RSP),
+                        rhs: Operand::Imm(stack_size as i64),
+                    });
+                }
+                for reg in callee_saved.iter().rev() {
+                    out.push(MirInst::Pop {
+                        dst: Reg::Phys(*reg),
+                    });
+                }
                 out.push(MirInst::Pop {
                     dst: Reg::Phys(PhysReg::RBP),
                 });
                 out.push(MirInst::Ret);
             }
-            MirInst::Push { src }
-            | MirInst::Pop { dst: src }
-            | MirInst::LoadStack { dst: src, .. }
-            | MirInst::StoreStack { src, .. } => {
+            MirInst::Push { src } | MirInst::Pop { dst: src } => {
                 if contains_vreg(*src) {
                     return Err(AllocError::new(
                         "input MIR must not contain stack/push/pop ops with virtual registers",
@@ -418,6 +533,86 @@ fn lower_mov_x86_64(
     Ok(out)
 }
 
+fn lower_load_stack_x86_64(
+    dst: Reg,
+    offset: i32,
+    allocations: &HashMap<usize, WorkingAlloc>,
+) -> Result<Vec<MirInst>, AllocError> {
+    let mut out = Vec::new();
+
+    match dst {
+        Reg::Phys(phys) => {
+            out.push(MirInst::LoadStack {
+                dst: Reg::Phys(phys),
+                offset,
+            });
+        }
+        Reg::VReg(vreg) => {
+            let alloc = get_alloc(vreg, allocations)?;
+            if let Some(phys) = alloc.reg {
+                out.push(MirInst::LoadStack {
+                    dst: Reg::Phys(phys),
+                    offset,
+                });
+            } else {
+                let slot = alloc
+                    .stack_offset
+                    .ok_or_else(|| AllocError::new("spilled vreg is missing a stack slot"))?;
+                out.push(MirInst::LoadStack {
+                    dst: Reg::Phys(PhysReg::R10),
+                    offset,
+                });
+                out.push(MirInst::StoreStack {
+                    src: Reg::Phys(PhysReg::R10),
+                    offset: slot,
+                });
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn lower_store_stack_x86_64(
+    src: Reg,
+    offset: i32,
+    allocations: &HashMap<usize, WorkingAlloc>,
+) -> Result<Vec<MirInst>, AllocError> {
+    let mut out = Vec::new();
+
+    match src {
+        Reg::Phys(phys) => {
+            out.push(MirInst::StoreStack {
+                src: Reg::Phys(phys),
+                offset,
+            });
+        }
+        Reg::VReg(vreg) => {
+            let alloc = get_alloc(vreg, allocations)?;
+            if let Some(phys) = alloc.reg {
+                out.push(MirInst::StoreStack {
+                    src: Reg::Phys(phys),
+                    offset,
+                });
+            } else {
+                let slot = alloc
+                    .stack_offset
+                    .ok_or_else(|| AllocError::new("spilled vreg is missing a stack slot"))?;
+                out.push(MirInst::LoadStack {
+                    dst: Reg::Phys(PhysReg::R10),
+                    offset: slot,
+                });
+                out.push(MirInst::StoreStack {
+                    src: Reg::Phys(PhysReg::R10),
+                    offset,
+                });
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 fn lower_arithmetic_x86_64(
     op: ArithOp,
     dst: Reg,
@@ -491,7 +686,17 @@ fn lower_arithmetic_x86_64(
             lhs: resolved_lhs.reg,
             rhs: resolved_rhs.operand,
         },
+        ArithOp::And => MirInst::And {
+            dst: dst_reg,
+            lhs: resolved_lhs.reg,
+            rhs: resolved_rhs.operand,
+        },
         ArithOp::Mul => MirInst::Mul {
+            dst: dst_reg,
+            lhs: resolved_lhs.reg,
+            rhs: resolved_rhs.operand,
+        },
+        ArithOp::Sdiv => MirInst::Sdiv {
             dst: dst_reg,
             lhs: resolved_lhs.reg,
             rhs: resolved_rhs.operand,
@@ -598,7 +803,12 @@ fn collect_vreg_uses(inst: &MirInst, out: &mut Vec<usize>) {
         MirInst::Mov { src, .. } => push_operand_vreg(src, out),
         MirInst::Add { lhs, rhs, .. }
         | MirInst::Sub { lhs, rhs, .. }
+        | MirInst::And { lhs, rhs, .. }
         | MirInst::Mul { lhs, rhs, .. } => {
+            push_reg_vreg(lhs, out);
+            push_operand_vreg(rhs, out);
+        }
+        MirInst::Sdiv { lhs, rhs, .. } => {
             push_reg_vreg(lhs, out);
             push_operand_vreg(rhs, out);
         }
@@ -624,7 +834,9 @@ fn collect_vreg_defs(inst: &MirInst, out: &mut Vec<usize>) {
         MirInst::Mov { dst, .. }
         | MirInst::Add { dst, .. }
         | MirInst::Sub { dst, .. }
+        | MirInst::And { dst, .. }
         | MirInst::Mul { dst, .. }
+        | MirInst::Sdiv { dst, .. }
         | MirInst::LoadStack { dst, .. }
         | MirInst::Pop { dst } => {
             push_reg_vreg(dst, out);
@@ -695,6 +907,19 @@ fn ensure_stack_slot(
     }
 }
 
+fn max_preexisting_stack_offset(func: &MirFunction) -> i32 {
+    let mut max_offset = 0;
+    for inst in &func.instructions {
+        match inst {
+            MirInst::LoadStack { offset, .. } | MirInst::StoreStack { offset, .. } => {
+                max_offset = max_offset.max(*offset);
+            }
+            _ => {}
+        }
+    }
+    max_offset
+}
+
 fn alloc_scratch(
     used_scratch: &mut Vec<PhysReg>,
     forbidden: &[PhysReg],
@@ -722,8 +947,35 @@ fn get_alloc(
         .ok_or_else(|| AllocError::new(format!("missing allocation for v{vreg}")))
 }
 
-fn align_to_16(value: usize) -> usize {
-    if value == 0 { 0 } else { (value + 15) & !15 }
+fn align_stack_size_for_calls(raw_stack_size: usize, callee_saved_count: usize) -> usize {
+    let mut stack_size = raw_stack_size;
+    let push_alignment = if callee_saved_count % 2 == 0 { 0 } else { 8 };
+    let remainder = stack_size % 16;
+    if remainder != push_alignment {
+        stack_size += (push_alignment + 16 - remainder) % 16;
+    }
+    stack_size
+}
+
+fn collect_used_callee_saved_registers(working: &HashMap<usize, WorkingAlloc>) -> Vec<PhysReg> {
+    let mut regs = Vec::new();
+    for state in working.values() {
+        if let Some(reg) = state.reg
+            && is_x86_64_callee_saved(reg)
+            && !regs.contains(&reg)
+        {
+            regs.push(reg);
+        }
+    }
+    regs.sort_by_key(|reg| match reg {
+        PhysReg::RBX => 0,
+        PhysReg::R12 => 1,
+        PhysReg::R13 => 2,
+        PhysReg::R14 => 3,
+        PhysReg::R15 => 4,
+        _ => usize::MAX,
+    });
+    regs
 }
 
 fn collect_phys_regs_for_mov(dst: Reg, src: &Operand) -> Vec<PhysReg> {
@@ -764,9 +1016,7 @@ fn collect_phys_regs_for_cmp(lhs: Reg, rhs: &Operand) -> Vec<PhysReg> {
 
 fn allocatable_x86_64_registers() -> &'static [PhysReg] {
     &[
-        PhysReg::RAX,
         PhysReg::RCX,
-        PhysReg::RDX,
         PhysReg::RSI,
         PhysReg::RDI,
         PhysReg::R8,
@@ -794,11 +1044,20 @@ fn is_x86_64_caller_saved(reg: PhysReg) -> bool {
     )
 }
 
+fn is_x86_64_callee_saved(reg: PhysReg) -> bool {
+    matches!(
+        reg,
+        PhysReg::RBX | PhysReg::R12 | PhysReg::R13 | PhysReg::R14 | PhysReg::R15
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ArithOp {
     Add,
     Sub,
+    And,
     Mul,
+    Sdiv,
 }
 
 #[cfg(test)]
@@ -984,5 +1243,105 @@ mod tests {
 
         assert!(asm.contains("pushq %rbp"));
         assert!(asm.contains("ret"));
+    }
+
+    #[test]
+    fn preserves_used_callee_saved_registers() {
+        let func = MirFunction::with_instructions(
+            "callee_saved_preserve",
+            vec![
+                MirInst::Mov {
+                    dst: Reg::VReg(0),
+                    src: Operand::Imm(1),
+                },
+                MirInst::Mov {
+                    dst: Reg::VReg(1),
+                    src: Operand::Imm(2),
+                },
+                MirInst::Mov {
+                    dst: Reg::VReg(2),
+                    src: Operand::Imm(3),
+                },
+                MirInst::Mov {
+                    dst: Reg::VReg(3),
+                    src: Operand::Imm(4),
+                },
+                MirInst::Mov {
+                    dst: Reg::VReg(4),
+                    src: Operand::Imm(5),
+                },
+                MirInst::Mov {
+                    dst: Reg::VReg(5),
+                    src: Operand::Imm(6),
+                },
+                MirInst::Add {
+                    dst: Reg::VReg(6),
+                    lhs: Reg::VReg(0),
+                    rhs: Operand::Reg(Reg::VReg(1)),
+                },
+                MirInst::Add {
+                    dst: Reg::VReg(7),
+                    lhs: Reg::VReg(2),
+                    rhs: Operand::Reg(Reg::VReg(3)),
+                },
+                MirInst::Add {
+                    dst: Reg::VReg(8),
+                    lhs: Reg::VReg(4),
+                    rhs: Operand::Reg(Reg::VReg(5)),
+                },
+                MirInst::Add {
+                    dst: Reg::VReg(9),
+                    lhs: Reg::VReg(6),
+                    rhs: Operand::Reg(Reg::VReg(7)),
+                },
+                MirInst::Add {
+                    dst: Reg::VReg(10),
+                    lhs: Reg::VReg(9),
+                    rhs: Operand::Reg(Reg::VReg(8)),
+                },
+                MirInst::Mov {
+                    dst: Reg::Phys(PhysReg::RAX),
+                    src: Operand::Reg(Reg::VReg(10)),
+                },
+                MirInst::Ret,
+            ],
+        );
+
+        let allocation =
+            linear_scan_allocate(&func, TargetArch::Amd64).expect("linear scan should succeed");
+
+        let mut used_callee_saved = Vec::new();
+        for state in allocation.allocations.values() {
+            if let Some(reg) = state.reg
+                && is_x86_64_callee_saved(reg)
+                && !used_callee_saved.contains(&reg)
+            {
+                used_callee_saved.push(reg);
+            }
+        }
+
+        assert!(
+            !used_callee_saved.is_empty(),
+            "expected at least one callee-saved register to be allocated"
+        );
+
+        for reg in used_callee_saved {
+            assert!(allocation.function.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    MirInst::Push {
+                        src: Reg::Phys(pushed),
+                    } if *pushed == reg
+                )
+            }));
+            assert!(allocation.function.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    MirInst::Pop {
+                        dst: Reg::Phys(popped),
+                    } if *popped == reg
+                )
+            }));
+        }
     }
 }

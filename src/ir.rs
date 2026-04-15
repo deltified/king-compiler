@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -996,6 +996,352 @@ pub fn build_factorial_il() -> Result<Function, IrBuildError> {
     Ok(builder.finish())
 }
 
+pub fn constant_fold(mut function: Function) -> Function {
+    let mut folded_instrs = HashSet::new();
+    let mut folded_values = Vec::new();
+
+    for block_id in function.block_order.clone() {
+        let Some(block) = function.blocks.get(block_id) else {
+            continue;
+        };
+
+        for instr_id in block.instructions.clone() {
+            let Some(instruction) = function.instructions.get(instr_id).cloned() else {
+                continue;
+            };
+
+            let Some(constant) = fold_instruction_constant(&function, &instruction) else {
+                continue;
+            };
+
+            let Some(result_value) = function.instr_results.get(&instr_id).copied() else {
+                continue;
+            };
+
+            folded_instrs.insert(instr_id);
+            folded_values.push((result_value, constant));
+        }
+    }
+
+    for (value, constant) in folded_values {
+        if let Some(data) = function.values.get_mut(value) {
+            data.kind = ValueKind::ConstantInt(constant);
+        }
+    }
+
+    for (_, block) in &mut function.blocks {
+        block
+            .instructions
+            .retain(|instr| !folded_instrs.contains(instr));
+    }
+
+    rebuild_instr_results(&mut function);
+    function
+}
+
+pub fn dead_code_elimination(mut function: Function) -> Function {
+    let mut live_instrs = HashSet::new();
+    let mut worklist = VecDeque::new();
+
+    for (instr_id, instruction) in &function.instructions {
+        if instruction.has_side_effects() {
+            live_instrs.insert(instr_id);
+            worklist.push_back(instr_id);
+        }
+    }
+
+    while let Some(instr_id) = worklist.pop_front() {
+        let Some(instruction) = function.instructions.get(instr_id).cloned() else {
+            continue;
+        };
+
+        for value in instruction_used_values(&instruction) {
+            let Some(value_data) = function.values.get(value) else {
+                continue;
+            };
+
+            let ValueKind::InstructionResult(dep_instr) = value_data.kind else {
+                continue;
+            };
+
+            if live_instrs.insert(dep_instr) {
+                worklist.push_back(dep_instr);
+            }
+        }
+    }
+
+    for (_, block) in &mut function.blocks {
+        block
+            .instructions
+            .retain(|instr| live_instrs.contains(instr));
+    }
+
+    let dead_instrs: Vec<_> = function
+        .instructions
+        .keys()
+        .filter(|instr_id| !live_instrs.contains(instr_id))
+        .collect();
+    for instr_id in dead_instrs {
+        function.instructions.remove(instr_id);
+    }
+
+    let dead_values: Vec<_> = function
+        .values
+        .iter()
+        .filter_map(|(value_id, value_data)| match value_data.kind {
+            ValueKind::InstructionResult(instr_id) if !live_instrs.contains(&instr_id) => {
+                Some(value_id)
+            }
+            _ => None,
+        })
+        .collect();
+    for value_id in dead_values {
+        function.values.remove(value_id);
+    }
+
+    rebuild_instr_results(&mut function);
+
+    function
+}
+
+pub fn simplify_cfg(mut function: Function) -> Function {
+    loop {
+        let predecessor_counts = predecessor_counts(&function);
+        let mut changed = false;
+
+        for block_id in function.block_order.clone() {
+            let Some(block) = function.blocks.get(block_id) else {
+                continue;
+            };
+
+            let Some(last_instr) = block.instructions.last().copied() else {
+                continue;
+            };
+
+            let target = match function.instructions.get(last_instr) {
+                Some(Instruction::Jmp { target }) => *target,
+                _ => continue,
+            };
+
+            if target == block_id {
+                continue;
+            }
+            if predecessor_counts.get(&target).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            if block_starts_with_phi(&function, target) {
+                continue;
+            }
+
+            let Some(target_block) = function.blocks.get(target) else {
+                continue;
+            };
+            let target_instructions = target_block.instructions.clone();
+
+            if let Some(block_mut) = function.blocks.get_mut(block_id) {
+                if block_mut.instructions.last().copied() == Some(last_instr) {
+                    block_mut.instructions.pop();
+                }
+                block_mut.instructions.extend(target_instructions);
+            }
+
+            function.blocks.remove(target);
+            function.block_order.retain(|block| *block != target);
+
+            for (_, instruction) in &mut function.instructions {
+                if let Instruction::Phi { incomings, .. } = instruction {
+                    for incoming in incomings {
+                        if incoming.block == target {
+                            incoming.block = block_id;
+                        }
+                    }
+                }
+            }
+
+            changed = true;
+            break;
+        }
+
+        if !changed {
+            break;
+        }
+
+        rebuild_cfg_metadata(&mut function);
+    }
+
+    rebuild_cfg_metadata(&mut function);
+    function
+}
+
+pub fn run_phase5_pipeline(function: Function) -> Function {
+    let function = constant_fold(function);
+    let function = dead_code_elimination(function);
+    simplify_cfg(function)
+}
+
+fn fold_instruction_constant(function: &Function, instruction: &Instruction) -> Option<i64> {
+    match instruction {
+        Instruction::Add { lhs, rhs, .. } => {
+            Some(constant_int(function, *lhs)? + constant_int(function, *rhs)?)
+        }
+        Instruction::Sub { lhs, rhs, .. } => {
+            Some(constant_int(function, *lhs)? - constant_int(function, *rhs)?)
+        }
+        Instruction::Mul { lhs, rhs, .. } => {
+            Some(constant_int(function, *lhs)? * constant_int(function, *rhs)?)
+        }
+        Instruction::Sdiv { lhs, rhs, .. } => {
+            let rhs_value = constant_int(function, *rhs)?;
+            if rhs_value == 0 {
+                None
+            } else {
+                Some(constant_int(function, *lhs)? / rhs_value)
+            }
+        }
+        Instruction::And { lhs, rhs, .. } => {
+            Some(constant_int(function, *lhs)? & constant_int(function, *rhs)?)
+        }
+        Instruction::Icmp { pred, lhs, rhs, .. } => {
+            let lhs = constant_int(function, *lhs)?;
+            let rhs = constant_int(function, *rhs)?;
+            let result = match pred {
+                IcmpPredicate::Eq => lhs == rhs,
+                IcmpPredicate::Ne => lhs != rhs,
+                IcmpPredicate::Slt => lhs < rhs,
+                IcmpPredicate::Sle => lhs <= rhs,
+                IcmpPredicate::Sgt => lhs > rhs,
+                IcmpPredicate::Sge => lhs >= rhs,
+            };
+            Some(if result { 1 } else { 0 })
+        }
+        _ => None,
+    }
+}
+
+fn constant_int(function: &Function, value: ValueId) -> Option<i64> {
+    let data = function.values.get(value)?;
+    match data.kind {
+        ValueKind::ConstantInt(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn instruction_used_values(instruction: &Instruction) -> Vec<ValueId> {
+    match instruction {
+        Instruction::Add { lhs, rhs, .. }
+        | Instruction::Sub { lhs, rhs, .. }
+        | Instruction::Mul { lhs, rhs, .. }
+        | Instruction::Sdiv { lhs, rhs, .. }
+        | Instruction::And { lhs, rhs, .. }
+        | Instruction::Icmp { lhs, rhs, .. } => vec![*lhs, *rhs],
+        Instruction::Store { value, ptr, .. } => vec![*value, *ptr],
+        Instruction::Load { ptr, .. } => vec![*ptr],
+        Instruction::Call { args, .. } => args.iter().map(|(_, value)| *value).collect(),
+        Instruction::Phi { incomings, .. } => {
+            incomings.iter().map(|incoming| incoming.value).collect()
+        }
+        Instruction::Br { cond, .. } => vec![*cond],
+        Instruction::Ret { value } => value.iter().copied().collect(),
+        Instruction::Alloca { .. } | Instruction::Jmp { .. } => Vec::new(),
+    }
+}
+
+fn predecessor_counts(function: &Function) -> HashMap<BlockId, usize> {
+    let mut counts = HashMap::new();
+    for (block_id, _) in &function.blocks {
+        counts.entry(block_id).or_insert(0);
+    }
+
+    for (_, block) in &function.blocks {
+        let Some(last_instr) = block.instructions.last() else {
+            continue;
+        };
+
+        let Some(instruction) = function.instructions.get(*last_instr) else {
+            continue;
+        };
+
+        match instruction {
+            Instruction::Jmp { target } => {
+                *counts.entry(*target).or_insert(0) += 1;
+            }
+            Instruction::Br {
+                then_block,
+                else_block,
+                ..
+            } => {
+                *counts.entry(*then_block).or_insert(0) += 1;
+                *counts.entry(*else_block).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+    }
+
+    counts
+}
+
+fn block_starts_with_phi(function: &Function, block: BlockId) -> bool {
+    let Some(block_data) = function.blocks.get(block) else {
+        return false;
+    };
+
+    let Some(first_instr) = block_data.instructions.first() else {
+        return false;
+    };
+
+    matches!(
+        function.instructions.get(*first_instr),
+        Some(Instruction::Phi { .. })
+    )
+}
+
+fn rebuild_instr_results(function: &mut Function) {
+    function.instr_results.clear();
+    for (value_id, value_data) in &function.values {
+        if let ValueKind::InstructionResult(instr_id) = value_data.kind {
+            function.instr_results.insert(instr_id, value_id);
+        }
+    }
+}
+
+fn rebuild_cfg_metadata(function: &mut Function) {
+    function.cfg = DiGraph::new();
+    function.block_nodes.clear();
+
+    function
+        .block_order
+        .retain(|block_id| function.blocks.contains_key(*block_id));
+
+    for block_id in function.block_order.clone() {
+        let node = function.cfg.add_node(block_id);
+        function.block_nodes.insert(block_id, node);
+    }
+
+    for block_id in function.block_order.clone() {
+        let Some(block) = function.blocks.get(block_id) else {
+            continue;
+        };
+        let Some(last_instr) = block.instructions.last() else {
+            continue;
+        };
+        let targets: Vec<BlockId> = match function.instructions.get(*last_instr) {
+            Some(Instruction::Jmp { target }) => vec![*target],
+            Some(Instruction::Br {
+                then_block,
+                else_block,
+                ..
+            }) => vec![*then_block, *else_block],
+            _ => Vec::new(),
+        };
+
+        for target in targets {
+            if function.block_nodes.contains_key(&target) {
+                let _ = function.add_edge(block_id, target);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,5 +1374,87 @@ mod tests {
         assert!(text.contains("phi i32"));
         assert!(text.contains("ret i32"));
         assert_eq!(function.cfg.edge_count(), 5);
+    }
+
+    #[test]
+    fn constant_fold_folds_simple_add() {
+        let mut builder = IrBuilder::new("main", Type::I32);
+        let entry = builder.create_block("entry");
+        builder
+            .position_at_end(entry)
+            .expect("entry block should exist");
+        let a = builder.build_const_i32(5).expect("const should build");
+        let b = builder.build_const_i32(5).expect("const should build");
+        let sum = builder.build_add(a, b).expect("add should build");
+        builder.build_ret(Some(sum)).expect("ret should build");
+
+        let folded = constant_fold(builder.finish());
+        let text = folded.format_il();
+
+        assert!(!text.contains("add i32"));
+        assert!(text.contains("ret i32 10"));
+    }
+
+    #[test]
+    fn dce_removes_unused_pure_instructions() {
+        let mut builder = IrBuilder::new("main", Type::I32);
+        let entry = builder.create_block("entry");
+        builder
+            .position_at_end(entry)
+            .expect("entry block should exist");
+        let a = builder.build_const_i32(7).expect("const should build");
+        let b = builder.build_const_i32(9).expect("const should build");
+        let _unused = builder.build_mul(a, b).expect("mul should build");
+        let ret_val = builder.build_const_i32(1).expect("const should build");
+        builder
+            .build_ret(Some(ret_val))
+            .expect("return should build");
+
+        let dce = dead_code_elimination(builder.finish());
+        let text = dce.format_il();
+
+        assert!(!text.contains("mul i32"));
+        assert!(text.contains("ret i32 1"));
+    }
+
+    #[test]
+    fn cfg_simplify_merges_linear_jump_blocks() {
+        let mut builder = IrBuilder::new("main", Type::I32);
+        let entry = builder.create_block("entry");
+        let mid = builder.create_block("mid");
+        let end = builder.create_block("end");
+
+        builder
+            .position_at_end(entry)
+            .expect("entry block should exist");
+        builder.build_jmp(mid).expect("jmp should build");
+
+        builder
+            .position_at_end(mid)
+            .expect("mid block should exist");
+        builder.build_jmp(end).expect("jmp should build");
+
+        builder
+            .position_at_end(end)
+            .expect("end block should exist");
+        let ret_val = builder.build_const_i32(2).expect("const should build");
+        builder.build_ret(Some(ret_val)).expect("ret should build");
+
+        let simplified = simplify_cfg(builder.finish());
+
+        assert_eq!(simplified.blocks.len(), 1);
+        assert_eq!(simplified.cfg.edge_count(), 0);
+        let text = simplified.format_il();
+        assert!(text.contains("ret i32 2"));
+    }
+
+    #[test]
+    fn phase5_pipeline_preserves_loop_carried_defs() {
+        let factorial = build_factorial_il().expect("factorial should build");
+        let optimized = run_phase5_pipeline(factorial);
+        let text = optimized.format_il();
+
+        assert!(text.contains("mul i32"));
+        assert!(text.contains("sub i32"));
     }
 }
