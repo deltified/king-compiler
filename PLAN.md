@@ -12,8 +12,7 @@ Before writing compiler logic, we must establish the data structures. If we were
 3.  **Basic Types:**
     *   Define the `Type` enum (`I8`, `I32`, `I64`, `Ptr`, `Void`).
 
-```
-# TODO:
+
 ---
 
 ### Phase 1: Machine IR (MIR) & Assembly Emission
@@ -28,6 +27,9 @@ Write this for arm64 first, then for x86_64.
 3.  **Write the ASM Printer:**
     *   Create a pass that takes a list of MIR instructions and formats them into an Assembly string.
     *   *Test:* Manually hardcode a MIR sequence that puts `42` into `RAX` and calls `Ret`. Pass it to the printer, save to `test.s`, run `gcc test.s -o test`, and check the exit code (`echo $?` should be 42).
+
+```
+# TODO:
 
 ---
 

@@ -153,6 +153,10 @@ pub enum MirInst {
     Add { dst: Reg, lhs: Reg, rhs: Operand },
     Sub { dst: Reg, lhs: Reg, rhs: Operand },
     Cmp { lhs: Reg, rhs: Operand },
+    Push { src: Reg },
+    Pop { dst: Reg },
+    LoadStack { dst: Reg, offset: i32 },
+    StoreStack { src: Reg, offset: i32 },
     Jmp { label: String },
     JmpIf { cond: Cond, label: String },
     Call { symbol: String },
@@ -249,6 +253,19 @@ pub fn emit_arm64_assembly(func: &MirFunction) -> Result<String, EmitError> {
                 let rhs = arm64_operand(rhs)?;
                 out.push_str(&format!("    cmp {}, {}\n", lhs, rhs));
             }
+            MirInst::Push { .. } | MirInst::Pop { .. } => {
+                return Err(EmitError::new(
+                    "push/pop pseudo-instructions are not supported on arm64",
+                ));
+            }
+            MirInst::LoadStack { dst, offset } => {
+                let dst = arm64_reg(*dst)?;
+                out.push_str(&format!("    ldr {}, [x29, #-{}]\n", dst, offset));
+            }
+            MirInst::StoreStack { src, offset } => {
+                let src = arm64_reg(*src)?;
+                out.push_str(&format!("    str {}, [x29, #-{}]\n", src, offset));
+            }
             MirInst::Jmp { label } => {
                 out.push_str(&format!("    b {}\n", label));
             }
@@ -340,6 +357,30 @@ pub fn emit_x86_64_assembly(func: &MirFunction) -> Result<String, EmitError> {
                     }
                 }
             }
+            MirInst::Push { src } => {
+                let src = x86_64_reg(*src)?;
+                out.push_str(&format!("    pushq {}\n", src));
+            }
+            MirInst::Pop { dst } => {
+                let dst = x86_64_reg(*dst)?;
+                out.push_str(&format!("    popq {}\n", dst));
+            }
+            MirInst::LoadStack { dst, offset } => {
+                let dst = x86_64_reg(*dst)?;
+                out.push_str(&format!(
+                    "    movq {}, {}\n",
+                    x86_64_stack_addr(*offset),
+                    dst
+                ));
+            }
+            MirInst::StoreStack { src, offset } => {
+                let src = x86_64_reg(*src)?;
+                out.push_str(&format!(
+                    "    movq {}, {}\n",
+                    src,
+                    x86_64_stack_addr(*offset)
+                ));
+            }
             MirInst::Jmp { label } => {
                 out.push_str(&format!("    jmp {}\n", label));
             }
@@ -408,6 +449,16 @@ fn x86_64_cond(cond: Cond) -> &'static str {
         Cond::Le => "jle",
         Cond::Gt => "jg",
         Cond::Ge => "jge",
+    }
+}
+
+fn x86_64_stack_addr(offset: i32) -> String {
+    if offset > 0 {
+        format!("-{}(%rbp)", offset)
+    } else if offset < 0 {
+        format!("{}(%rbp)", -offset)
+    } else {
+        "(%rbp)".to_string()
     }
 }
 
