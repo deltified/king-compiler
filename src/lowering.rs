@@ -111,10 +111,7 @@ pub fn lower_il_to_mir(
     function: &Function,
     target: TargetArch,
 ) -> Result<MirFunction, LoweringError> {
-    match target {
-        TargetArch::Amd64 | TargetArch::X86_64 => {}
-        TargetArch::Arm64 => return Err(LoweringError::UnsupportedTarget(target)),
-    }
+    let call_conv = CallConv::for_target(target)?;
 
     let phi = eliminate_phi_nodes(function)?;
     let instr_results = instruction_result_map(function);
@@ -151,14 +148,7 @@ pub fn lower_il_to_mir(
     let mut next_vreg = 0usize;
     let mut alloca_slots: HashMap<ValueId, i32> = HashMap::new();
     let mut next_alloca_offset: i32 = 0;
-    let arg_regs = [
-        PhysReg::RDI,
-        PhysReg::RSI,
-        PhysReg::RDX,
-        PhysReg::RCX,
-        PhysReg::R8,
-        PhysReg::R9,
-    ];
+    let arg_regs = call_conv.arg_regs;
     for (value_id, value) in &function.values {
         if !matches!(value.kind, ValueKind::ConstantInt(_)) {
             value_vregs.insert(value_id, next_vreg);
@@ -329,7 +319,7 @@ pub fn lower_il_to_mir(
                 Instruction::Ret { value } => {
                     if let Some(value) = value {
                         out.push(MirInst::Mov {
-                            dst: Reg::Phys(PhysReg::RAX),
+                            dst: Reg::Phys(call_conv.return_reg),
                             src: value_operand(function, *value, &value_vregs)?,
                         });
                     }
@@ -376,7 +366,7 @@ pub fn lower_il_to_mir(
                         let dst = value_reg(dst_value, &value_vregs)?;
                         out.push(MirInst::Mov {
                             dst,
-                            src: Operand::Reg(Reg::Phys(PhysReg::RAX)),
+                            src: Operand::Reg(Reg::Phys(call_conv.return_reg)),
                         });
                     }
                 }
@@ -440,6 +430,46 @@ pub fn lower_il_to_mir(
     }
 
     Ok(MirFunction::with_instructions(function.name.clone(), out))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CallConv {
+    arg_regs: &'static [PhysReg],
+    return_reg: PhysReg,
+}
+
+impl CallConv {
+    fn for_target(target: TargetArch) -> Result<Self, LoweringError> {
+        const X86_64_ARGS: &[PhysReg] = &[
+            PhysReg::RDI,
+            PhysReg::RSI,
+            PhysReg::RDX,
+            PhysReg::RCX,
+            PhysReg::R8,
+            PhysReg::R9,
+        ];
+        const ARM64_ARGS: &[PhysReg] = &[
+            PhysReg::X0,
+            PhysReg::X1,
+            PhysReg::X2,
+            PhysReg::X3,
+            PhysReg::X4,
+            PhysReg::X5,
+            PhysReg::X6,
+            PhysReg::X7,
+        ];
+
+        match target {
+            TargetArch::Amd64 | TargetArch::X86_64 => Ok(Self {
+                arg_regs: X86_64_ARGS,
+                return_reg: PhysReg::RAX,
+            }),
+            TargetArch::Arm64 => Ok(Self {
+                arg_regs: ARM64_ARGS,
+                return_reg: PhysReg::X0,
+            }),
+        }
+    }
 }
 
 fn instruction_result_map(function: &Function) -> HashMap<InstrId, ValueId> {

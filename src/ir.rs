@@ -599,6 +599,10 @@ impl IrBuilder {
         &self.function
     }
 
+    pub fn current_block(&self) -> Option<BlockId> {
+        self.current_block
+    }
+
     pub fn add_param(&mut self, name: impl Into<String>, ty: Type) -> ValueId {
         self.function.add_param(name, ty)
     }

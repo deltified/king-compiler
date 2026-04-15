@@ -184,10 +184,409 @@ pub fn linear_scan_allocate(
     match target {
         TargetArch::Amd64 => linear_scan_allocate_x86_64(func),
         TargetArch::X86_64 => linear_scan_allocate_x86_64(func),
-        TargetArch::Arm64 => Err(AllocError::new(
-            "linear-scan allocation is currently implemented for amd64/x86_64",
-        )),
+        TargetArch::Arm64 => linear_scan_allocate_arm64(func),
     }
+}
+
+fn linear_scan_allocate_arm64(func: &MirFunction) -> Result<LinearScanAllocation, AllocError> {
+    let intervals = compute_live_intervals(func);
+    let preexisting_stack = max_preexisting_stack_offset(func);
+
+    let mut allocations = BTreeMap::new();
+    let mut next_stack_offset = preexisting_stack;
+
+    for interval in &intervals {
+        next_stack_offset += 8;
+        allocations.insert(
+            interval.vreg,
+            VRegAllocation {
+                reg: None,
+                stack_offset: Some(next_stack_offset),
+            },
+        );
+    }
+
+    // Reserve frame-pointer and link-register spill slots beyond all user/lowering stack slots.
+    let saved_fp_offset = next_stack_offset + 8;
+    let saved_lr_offset = next_stack_offset + 16;
+    let raw_stack_size = saved_lr_offset as usize;
+    let stack_size = ((raw_stack_size + 15) / 16) * 16;
+
+    let lowered = rewrite_with_allocations_arm64(
+        func,
+        &allocations,
+        stack_size,
+        saved_fp_offset,
+        saved_lr_offset,
+    )?;
+    let allocated_func = MirFunction::with_instructions(func.name.clone(), lowered);
+
+    Ok(LinearScanAllocation {
+        function: allocated_func,
+        intervals,
+        allocations,
+        stack_size,
+    })
+}
+
+fn rewrite_with_allocations_arm64(
+    func: &MirFunction,
+    allocations: &BTreeMap<usize, VRegAllocation>,
+    stack_size: usize,
+    saved_fp_offset: i32,
+    saved_lr_offset: i32,
+) -> Result<Vec<MirInst>, AllocError> {
+    let mut out = Vec::new();
+
+    // Preserve caller frame pointer before we repurpose x29 as our frame base.
+    out.push(MirInst::Mov {
+        dst: Reg::Phys(PhysReg::X16),
+        src: Operand::Reg(Reg::Phys(PhysReg::X29)),
+    });
+    if stack_size > 0 {
+        out.push(MirInst::Sub {
+            dst: Reg::Phys(PhysReg::SP),
+            lhs: Reg::Phys(PhysReg::SP),
+            rhs: Operand::Imm(stack_size as i64),
+        });
+    }
+    out.push(MirInst::Add {
+        dst: Reg::Phys(PhysReg::X29),
+        lhs: Reg::Phys(PhysReg::SP),
+        rhs: Operand::Imm(stack_size as i64),
+    });
+    out.push(MirInst::StoreStack {
+        src: Reg::Phys(PhysReg::X16),
+        offset: saved_fp_offset,
+    });
+    out.push(MirInst::StoreStack {
+        src: Reg::Phys(PhysReg::X30),
+        offset: saved_lr_offset,
+    });
+
+    for inst in &func.instructions {
+        match inst {
+            MirInst::Label(label) => out.push(MirInst::Label(label.clone())),
+            MirInst::Mov { dst, src } => {
+                out.extend(lower_mov_arm64(*dst, src, allocations)?);
+            }
+            MirInst::Add { dst, lhs, rhs } => {
+                out.extend(lower_arithmetic_arm64(
+                    ArithOp::Add,
+                    *dst,
+                    *lhs,
+                    rhs,
+                    allocations,
+                )?);
+            }
+            MirInst::Sub { dst, lhs, rhs } => {
+                out.extend(lower_arithmetic_arm64(
+                    ArithOp::Sub,
+                    *dst,
+                    *lhs,
+                    rhs,
+                    allocations,
+                )?);
+            }
+            MirInst::And { dst, lhs, rhs } => {
+                out.extend(lower_arithmetic_arm64(
+                    ArithOp::And,
+                    *dst,
+                    *lhs,
+                    rhs,
+                    allocations,
+                )?);
+            }
+            MirInst::Mul { dst, lhs, rhs } => {
+                out.extend(lower_arithmetic_arm64(
+                    ArithOp::Mul,
+                    *dst,
+                    *lhs,
+                    rhs,
+                    allocations,
+                )?);
+            }
+            MirInst::Sdiv { dst, lhs, rhs } => {
+                out.extend(lower_arithmetic_arm64(
+                    ArithOp::Sdiv,
+                    *dst,
+                    *lhs,
+                    rhs,
+                    allocations,
+                )?);
+            }
+            MirInst::Cmp { lhs, rhs } => {
+                out.extend(lower_cmp_arm64(*lhs, rhs, allocations)?);
+            }
+            MirInst::LoadStack { dst, offset } => {
+                out.extend(lower_load_stack_arm64(*dst, *offset, allocations)?);
+            }
+            MirInst::StoreStack { src, offset } => {
+                out.extend(lower_store_stack_arm64(*src, *offset, allocations)?);
+            }
+            MirInst::Jmp { label } => out.push(MirInst::Jmp {
+                label: label.clone(),
+            }),
+            MirInst::JmpIf { cond, label } => out.push(MirInst::JmpIf {
+                cond: *cond,
+                label: label.clone(),
+            }),
+            MirInst::Call { symbol } => out.push(MirInst::Call {
+                symbol: symbol.clone(),
+            }),
+            MirInst::Ret => {
+                out.push(MirInst::LoadStack {
+                    dst: Reg::Phys(PhysReg::X30),
+                    offset: saved_lr_offset,
+                });
+                out.push(MirInst::LoadStack {
+                    dst: Reg::Phys(PhysReg::X29),
+                    offset: saved_fp_offset,
+                });
+                if stack_size > 0 {
+                    out.push(MirInst::Add {
+                        dst: Reg::Phys(PhysReg::SP),
+                        lhs: Reg::Phys(PhysReg::SP),
+                        rhs: Operand::Imm(stack_size as i64),
+                    });
+                }
+                out.push(MirInst::Ret);
+            }
+            MirInst::Push { .. } | MirInst::Pop { .. } => {
+                return Err(AllocError::new(
+                    "push/pop pseudo-instructions are not supported in arm64 allocation",
+                ));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn lower_mov_arm64(
+    dst: Reg,
+    src: &Operand,
+    allocations: &BTreeMap<usize, VRegAllocation>,
+) -> Result<Vec<MirInst>, AllocError> {
+    let mut out = Vec::new();
+    let resolved_src = resolve_operand_use_arm64(src.clone(), allocations, &mut out)?;
+
+    match dst {
+        Reg::Phys(phys) => out.push(MirInst::Mov {
+            dst: Reg::Phys(phys),
+            src: resolved_src,
+        }),
+        Reg::VReg(vreg) => {
+            let slot = slot_for_vreg(vreg, allocations)?;
+            match resolved_src {
+                Operand::Reg(Reg::Phys(src_phys)) => {
+                    out.push(MirInst::StoreStack {
+                        src: Reg::Phys(src_phys),
+                        offset: slot,
+                    });
+                }
+                Operand::Imm(imm) => {
+                    out.push(MirInst::Mov {
+                        dst: Reg::Phys(PhysReg::X16),
+                        src: Operand::Imm(imm),
+                    });
+                    out.push(MirInst::StoreStack {
+                        src: Reg::Phys(PhysReg::X16),
+                        offset: slot,
+                    });
+                }
+                Operand::Reg(Reg::VReg(_)) => {
+                    return Err(AllocError::new(
+                        "resolved arm64 operand still contains virtual register",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn lower_arithmetic_arm64(
+    op: ArithOp,
+    dst: Reg,
+    lhs: Reg,
+    rhs: &Operand,
+    allocations: &BTreeMap<usize, VRegAllocation>,
+) -> Result<Vec<MirInst>, AllocError> {
+    let mut out = Vec::new();
+
+    let lhs_reg = resolve_use_reg_arm64(lhs, allocations, &mut out, PhysReg::X16)?;
+    let mut rhs_operand = resolve_operand_use_arm64(rhs.clone(), allocations, &mut out)?;
+
+    if matches!(op, ArithOp::And | ArithOp::Mul | ArithOp::Sdiv)
+        && let Operand::Imm(imm) = rhs_operand
+    {
+        out.push(MirInst::Mov {
+            dst: Reg::Phys(PhysReg::X17),
+            src: Operand::Imm(imm),
+        });
+        rhs_operand = Operand::Reg(Reg::Phys(PhysReg::X17));
+    }
+
+    let (dst_reg, dst_slot) = match dst {
+        Reg::Phys(phys) => (Reg::Phys(phys), None),
+        Reg::VReg(vreg) => (
+            Reg::Phys(PhysReg::X15),
+            Some(slot_for_vreg(vreg, allocations)?),
+        ),
+    };
+
+    out.push(match op {
+        ArithOp::Add => MirInst::Add {
+            dst: dst_reg,
+            lhs: lhs_reg,
+            rhs: rhs_operand,
+        },
+        ArithOp::Sub => MirInst::Sub {
+            dst: dst_reg,
+            lhs: lhs_reg,
+            rhs: rhs_operand,
+        },
+        ArithOp::And => MirInst::And {
+            dst: dst_reg,
+            lhs: lhs_reg,
+            rhs: rhs_operand,
+        },
+        ArithOp::Mul => MirInst::Mul {
+            dst: dst_reg,
+            lhs: lhs_reg,
+            rhs: rhs_operand,
+        },
+        ArithOp::Sdiv => MirInst::Sdiv {
+            dst: dst_reg,
+            lhs: lhs_reg,
+            rhs: rhs_operand,
+        },
+    });
+
+    if let Some(slot) = dst_slot {
+        out.push(MirInst::StoreStack {
+            src: dst_reg,
+            offset: slot,
+        });
+    }
+
+    Ok(out)
+}
+
+fn lower_cmp_arm64(
+    lhs: Reg,
+    rhs: &Operand,
+    allocations: &BTreeMap<usize, VRegAllocation>,
+) -> Result<Vec<MirInst>, AllocError> {
+    let mut out = Vec::new();
+    let lhs_reg = resolve_use_reg_arm64(lhs, allocations, &mut out, PhysReg::X16)?;
+    let rhs_operand = resolve_operand_use_arm64(rhs.clone(), allocations, &mut out)?;
+    out.push(MirInst::Cmp {
+        lhs: lhs_reg,
+        rhs: rhs_operand,
+    });
+    Ok(out)
+}
+
+fn lower_load_stack_arm64(
+    dst: Reg,
+    offset: i32,
+    allocations: &BTreeMap<usize, VRegAllocation>,
+) -> Result<Vec<MirInst>, AllocError> {
+    let mut out = Vec::new();
+
+    match dst {
+        Reg::Phys(phys) => out.push(MirInst::LoadStack {
+            dst: Reg::Phys(phys),
+            offset,
+        }),
+        Reg::VReg(vreg) => {
+            let slot = slot_for_vreg(vreg, allocations)?;
+            out.push(MirInst::LoadStack {
+                dst: Reg::Phys(PhysReg::X16),
+                offset,
+            });
+            out.push(MirInst::StoreStack {
+                src: Reg::Phys(PhysReg::X16),
+                offset: slot,
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+fn lower_store_stack_arm64(
+    src: Reg,
+    offset: i32,
+    allocations: &BTreeMap<usize, VRegAllocation>,
+) -> Result<Vec<MirInst>, AllocError> {
+    let mut out = Vec::new();
+
+    match src {
+        Reg::Phys(phys) => out.push(MirInst::StoreStack {
+            src: Reg::Phys(phys),
+            offset,
+        }),
+        Reg::VReg(vreg) => {
+            let slot = slot_for_vreg(vreg, allocations)?;
+            out.push(MirInst::LoadStack {
+                dst: Reg::Phys(PhysReg::X16),
+                offset: slot,
+            });
+            out.push(MirInst::StoreStack {
+                src: Reg::Phys(PhysReg::X16),
+                offset,
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+fn resolve_use_reg_arm64(
+    reg: Reg,
+    allocations: &BTreeMap<usize, VRegAllocation>,
+    out: &mut Vec<MirInst>,
+    scratch: PhysReg,
+) -> Result<Reg, AllocError> {
+    match reg {
+        Reg::Phys(phys) => Ok(Reg::Phys(phys)),
+        Reg::VReg(vreg) => {
+            let slot = slot_for_vreg(vreg, allocations)?;
+            out.push(MirInst::LoadStack {
+                dst: Reg::Phys(scratch),
+                offset: slot,
+            });
+            Ok(Reg::Phys(scratch))
+        }
+    }
+}
+
+fn resolve_operand_use_arm64(
+    operand: Operand,
+    allocations: &BTreeMap<usize, VRegAllocation>,
+    out: &mut Vec<MirInst>,
+) -> Result<Operand, AllocError> {
+    match operand {
+        Operand::Imm(imm) => Ok(Operand::Imm(imm)),
+        Operand::Reg(reg) => {
+            let resolved = resolve_use_reg_arm64(reg, allocations, out, PhysReg::X17)?;
+            Ok(Operand::Reg(resolved))
+        }
+    }
+}
+
+fn slot_for_vreg(
+    vreg: usize,
+    allocations: &BTreeMap<usize, VRegAllocation>,
+) -> Result<i32, AllocError> {
+    allocations
+        .get(&vreg)
+        .and_then(|entry| entry.stack_offset)
+        .ok_or_else(|| AllocError::new(format!("missing stack slot for arm64 v{vreg}")))
 }
 
 fn linear_scan_allocate_x86_64(func: &MirFunction) -> Result<LinearScanAllocation, AllocError> {

@@ -12,6 +12,15 @@ mod macos_e2e {
     use king_compiler::mir::{TargetArch, emit_assembly};
     use king_compiler::regalloc::linear_scan_allocate;
 
+    const MINILANG_COMPLEX_SOURCE: &str = r#"
+        fn fib(n) = if n <= 1 then n else fib(n - 1) + fib(n - 2);
+        fn array_pick() = [5, 8, 13, 21][1];
+        fn byte_pick() = "AZ"[1];
+        fn bump(x) = x + len("xyz");
+        fn edge() = [1, 2, 3][1 + 1] + "abcd"[0 + 2];
+        fn main() = if fib(7) == 13 then bump(array_pick() + byte_pick() - 59) + edge() - 102 else 0;
+    "#;
+
     #[test]
     fn backend_e2e_macos_x86_64_paths() -> Result<(), Box<dyn Error>> {
         let workdir = create_workdir()?;
@@ -123,30 +132,37 @@ mod macos_e2e {
     #[test]
     fn minilang_e2e_macos_x86_64() -> Result<(), Box<dyn Error>> {
         let workdir = create_workdir()?;
-        let source = r#"
-            fn add2(a, b) = a + b;
-            fn crunch(x) = (x / 2) & 31;
-            fn main() = add2(crunch(84), 32);
-        "#;
-
-        let functions = compile_source_to_ir(source)?;
-        assert!(functions.iter().any(|function| function.name == "main"));
-
-        let mut asm_paths = Vec::new();
-        for function in &functions {
-            let asm = emit_amd64_asm(function)?;
-            let asm_path = write_file(&workdir, &format!("{}.s", function.name), &asm)?;
-            asm_paths.push(asm_path);
-        }
-
-        let source_paths: Vec<&Path> = asm_paths.iter().map(|path| path.as_path()).collect();
-        let output = workdir.join("minilang_bin");
-        compile_x86_64_macos(&source_paths, &output)?;
+        let output = compile_minilang_binary(
+            &workdir,
+            MINILANG_COMPLEX_SOURCE,
+            TargetArch::Amd64,
+            "minilang_bin",
+        )?;
 
         assert_eq!(
             run_x86_64_binary(&output)?,
             42,
-            "mini language program should return 42"
+            "complex mini language x86_64 program should return 42"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn minilang_e2e_macos_arm64() -> Result<(), Box<dyn Error>> {
+        let workdir = create_workdir()?;
+        let output = compile_minilang_binary(
+            &workdir,
+            MINILANG_COMPLEX_SOURCE,
+            TargetArch::Arm64,
+            "minilang_arm64_bin",
+        )?;
+
+        assert_eq!(
+            run_arm64_binary(&output)?,
+            42,
+            "complex mini language arm64 program should return 42"
         );
 
         Ok(())
@@ -219,9 +235,57 @@ mod macos_e2e {
     }
 
     fn emit_amd64_asm(function: &Function) -> Result<String, Box<dyn Error>> {
-        let mir = lower_il_to_mir(function, TargetArch::Amd64)?;
-        let allocated = linear_scan_allocate(&mir, TargetArch::Amd64)?;
-        Ok(emit_assembly(&allocated.function, TargetArch::Amd64)?)
+        emit_target_asm(function, TargetArch::Amd64)
+    }
+
+    fn emit_arm64_asm(function: &Function) -> Result<String, Box<dyn Error>> {
+        emit_target_asm(function, TargetArch::Arm64)
+    }
+
+    fn emit_target_asm(function: &Function, target: TargetArch) -> Result<String, Box<dyn Error>> {
+        let mir = lower_il_to_mir(function, target)?;
+        let allocated = linear_scan_allocate(&mir, target)?;
+        Ok(emit_assembly(&allocated.function, target)?)
+    }
+
+    fn compile_minilang_binary(
+        workdir: &Path,
+        source: &str,
+        target: TargetArch,
+        output_name: &str,
+    ) -> Result<PathBuf, Box<dyn Error>> {
+        let functions = compile_source_to_ir(source)?;
+        assert!(functions.iter().any(|function| function.name == "main"));
+
+        let mut asm_paths = Vec::new();
+        for function in &functions {
+            let asm = match target {
+                TargetArch::Arm64 => emit_arm64_asm(function)?,
+                TargetArch::Amd64 | TargetArch::X86_64 => emit_amd64_asm(function)?,
+            };
+            let asm_path = write_file(
+                workdir,
+                &format!(
+                    "{}_{}.s",
+                    function.name,
+                    match target {
+                        TargetArch::Arm64 => "arm64",
+                        TargetArch::Amd64 | TargetArch::X86_64 => "x86_64",
+                    }
+                ),
+                &asm,
+            )?;
+            asm_paths.push(asm_path);
+        }
+
+        let source_paths: Vec<&Path> = asm_paths.iter().map(|path| path.as_path()).collect();
+        let output = workdir.join(output_name);
+        match target {
+            TargetArch::Arm64 => compile_arm64_macos(&source_paths, &output)?,
+            TargetArch::Amd64 | TargetArch::X86_64 => compile_x86_64_macos(&source_paths, &output)?,
+        }
+
+        Ok(output)
     }
 
     fn create_workdir() -> Result<PathBuf, Box<dyn Error>> {
@@ -254,6 +318,22 @@ mod macos_e2e {
         Ok(())
     }
 
+    fn compile_arm64_macos(sources: &[&Path], output: &Path) -> Result<(), Box<dyn Error>> {
+        let mut cmd = Command::new("cc");
+        cmd.arg("-target").arg("arm64-apple-macos13");
+        for source in sources {
+            cmd.arg(source);
+        }
+        cmd.arg("-o").arg(output);
+
+        let result = cmd.output()?;
+        if !result.status.success() {
+            return Err(format!("cc failed: {}", String::from_utf8_lossy(&result.stderr)).into());
+        }
+
+        Ok(())
+    }
+
     fn run_x86_64_binary(binary: &Path) -> Result<i32, Box<dyn Error>> {
         let status = if cfg!(target_arch = "aarch64") {
             Command::new("arch").arg("-x86_64").arg(binary).status()?
@@ -261,6 +341,13 @@ mod macos_e2e {
             Command::new(binary).status()?
         };
 
+        status
+            .code()
+            .ok_or_else(|| "process terminated by signal".into())
+    }
+
+    fn run_arm64_binary(binary: &Path) -> Result<i32, Box<dyn Error>> {
+        let status = Command::new(binary).status()?;
         status
             .code()
             .ok_or_else(|| "process terminated by signal".into())
