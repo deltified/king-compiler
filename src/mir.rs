@@ -153,6 +153,7 @@ pub enum MirInst {
     Mov { dst: Reg, src: Operand },
     Add { dst: Reg, lhs: Reg, rhs: Operand },
     Sub { dst: Reg, lhs: Reg, rhs: Operand },
+    Mul { dst: Reg, lhs: Reg, rhs: Operand },
     Cmp { lhs: Reg, rhs: Operand },
     Push { src: Reg },
     Pop { dst: Reg },
@@ -250,6 +251,17 @@ pub fn emit_arm64_assembly(func: &MirFunction) -> Result<String, EmitError> {
                 let rhs = arm64_operand(rhs)?;
                 out.push_str(&format!("    sub {}, {}, {}\n", dst, lhs, rhs));
             }
+            MirInst::Mul { dst, lhs, rhs } => {
+                let dst = arm64_reg(*dst)?;
+                let lhs = arm64_reg(*lhs)?;
+                let rhs = match rhs {
+                    Operand::Reg(reg) => arm64_reg(*reg)?,
+                    Operand::Imm(_) => {
+                        return Err(EmitError::new("arm64 mul requires a register rhs operand"));
+                    }
+                };
+                out.push_str(&format!("    mul {}, {}, {}\n", dst, lhs, rhs));
+            }
             MirInst::Cmp { lhs, rhs } => {
                 let lhs = arm64_reg(*lhs)?;
                 let rhs = arm64_operand(rhs)?;
@@ -344,6 +356,24 @@ pub fn emit_x86_64_assembly(func: &MirFunction) -> Result<String, EmitError> {
                     }
                     Operand::Imm(imm) => {
                         out.push_str(&format!("    subq ${}, {}\n", imm, dst_name));
+                    }
+                }
+            }
+            MirInst::Mul { dst, lhs, rhs } => {
+                let dst_name = x86_64_reg(*dst)?;
+                let lhs_name = x86_64_reg(*lhs)?;
+
+                if dst_name != lhs_name {
+                    out.push_str(&format!("    movq {}, {}\n", lhs_name, dst_name));
+                }
+
+                match rhs {
+                    Operand::Reg(reg) => {
+                        let rhs = x86_64_reg(*reg)?;
+                        out.push_str(&format!("    imulq {}, {}\n", rhs, dst_name));
+                    }
+                    Operand::Imm(imm) => {
+                        out.push_str(&format!("    imulq ${}, {}\n", imm, dst_name));
                     }
                 }
             }

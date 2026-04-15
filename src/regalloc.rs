@@ -250,11 +250,26 @@ fn rewrite_with_allocations_x86_64(
                 out.extend(lower_mov_x86_64(*dst, src, allocations)?);
             }
             MirInst::Add { dst, lhs, rhs } => {
-                out.extend(lower_arithmetic_x86_64(true, *dst, *lhs, rhs, allocations)?);
+                out.extend(lower_arithmetic_x86_64(
+                    ArithOp::Add,
+                    *dst,
+                    *lhs,
+                    rhs,
+                    allocations,
+                )?);
             }
             MirInst::Sub { dst, lhs, rhs } => {
                 out.extend(lower_arithmetic_x86_64(
-                    false,
+                    ArithOp::Sub,
+                    *dst,
+                    *lhs,
+                    rhs,
+                    allocations,
+                )?);
+            }
+            MirInst::Mul { dst, lhs, rhs } => {
+                out.extend(lower_arithmetic_x86_64(
+                    ArithOp::Mul,
                     *dst,
                     *lhs,
                     rhs,
@@ -404,7 +419,7 @@ fn lower_mov_x86_64(
 }
 
 fn lower_arithmetic_x86_64(
-    is_add: bool,
+    op: ArithOp,
     dst: Reg,
     lhs: Reg,
     rhs: &Operand,
@@ -465,18 +480,22 @@ fn lower_arithmetic_x86_64(
         }
     };
 
-    let arith_inst = if is_add {
-        MirInst::Add {
+    let arith_inst = match op {
+        ArithOp::Add => MirInst::Add {
             dst: dst_reg,
             lhs: resolved_lhs.reg,
             rhs: resolved_rhs.operand,
-        }
-    } else {
-        MirInst::Sub {
+        },
+        ArithOp::Sub => MirInst::Sub {
             dst: dst_reg,
             lhs: resolved_lhs.reg,
             rhs: resolved_rhs.operand,
-        }
+        },
+        ArithOp::Mul => MirInst::Mul {
+            dst: dst_reg,
+            lhs: resolved_lhs.reg,
+            rhs: resolved_rhs.operand,
+        },
     };
     out.push(arith_inst);
 
@@ -577,7 +596,9 @@ fn resolve_operand_use_x86_64(
 fn collect_vreg_uses(inst: &MirInst, out: &mut Vec<usize>) {
     match inst {
         MirInst::Mov { src, .. } => push_operand_vreg(src, out),
-        MirInst::Add { lhs, rhs, .. } | MirInst::Sub { lhs, rhs, .. } => {
+        MirInst::Add { lhs, rhs, .. }
+        | MirInst::Sub { lhs, rhs, .. }
+        | MirInst::Mul { lhs, rhs, .. } => {
             push_reg_vreg(lhs, out);
             push_operand_vreg(rhs, out);
         }
@@ -603,6 +624,7 @@ fn collect_vreg_defs(inst: &MirInst, out: &mut Vec<usize>) {
         MirInst::Mov { dst, .. }
         | MirInst::Add { dst, .. }
         | MirInst::Sub { dst, .. }
+        | MirInst::Mul { dst, .. }
         | MirInst::LoadStack { dst, .. }
         | MirInst::Pop { dst } => {
             push_reg_vreg(dst, out);
@@ -770,6 +792,13 @@ fn is_x86_64_caller_saved(reg: PhysReg) -> bool {
             | PhysReg::R10
             | PhysReg::R11
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArithOp {
+    Add,
+    Sub,
+    Mul,
 }
 
 #[cfg(test)]

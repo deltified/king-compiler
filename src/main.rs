@@ -1,6 +1,7 @@
-use king_compiler::ir::build_factorial_il;
+use king_compiler::ir::{IrBuilder, Type, build_factorial_il};
+use king_compiler::lowering::lower_il_to_mir;
 use king_compiler::mir::{
-    MirFunction, MirInst, Operand, PhysReg, Reg, TargetArch, emit_arm64_assembly,
+    MirFunction, MirInst, Operand, PhysReg, Reg, TargetArch, emit_arm64_assembly, emit_assembly,
     emit_x86_64_assembly,
 };
 use king_compiler::regalloc::linear_scan_allocate;
@@ -57,7 +58,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write("factorial.il", &factorial_text)?;
     println!("Phase 3 factorial IL:\n{factorial_text}");
 
+    let phase4_main_il = build_phase4_main_il()?;
+    let phase4_main_mir = lower_il_to_mir(&phase4_main_il, TargetArch::Amd64)?;
+    let phase4_main_allocated = linear_scan_allocate(&phase4_main_mir, TargetArch::Amd64)?;
+    let phase4_main_asm = emit_assembly(&phase4_main_allocated.function, TargetArch::Amd64)?;
+    std::fs::write("phase4_main_x86_64.s", &phase4_main_asm)?;
+
+    let phase4_factorial_mir = lower_il_to_mir(&factorial, TargetArch::Amd64)?;
+    let phase4_factorial_allocated =
+        linear_scan_allocate(&phase4_factorial_mir, TargetArch::Amd64)?;
+    let phase4_factorial_asm =
+        emit_assembly(&phase4_factorial_allocated.function, TargetArch::Amd64)?;
+    std::fs::write("phase4_factorial_x86_64.s", &phase4_factorial_asm)?;
+
+    println!("Phase 4 wrote phase4_main_x86_64.s and phase4_factorial_x86_64.s");
+
     Ok(())
+}
+
+fn build_phase4_main_il() -> Result<king_compiler::ir::Function, king_compiler::ir::IrBuildError> {
+    let mut builder = IrBuilder::new("main", Type::I32);
+    let entry = builder.create_block("entry");
+    builder.position_at_end(entry)?;
+    let value_42 = builder.build_const_i32(42)?;
+    builder.build_ret(Some(value_42))?;
+    Ok(builder.finish())
 }
 
 fn build_linear_scan_phase2_demo() -> MirFunction {
