@@ -28,8 +28,7 @@ Write this for arm64 first, then for x86_64.
     *   Create a pass that takes a list of MIR instructions and formats them into an Assembly string.
     *   *Test:* Manually hardcode a MIR sequence that puts `42` into `RAX` and calls `Ret`. Pass it to the printer, save to `test.s`, run `gcc test.s -o test`, and check the exit code (`echo $?` should be 42).
 
-```
-# TODO:
+
 
 ---
 
@@ -46,6 +45,9 @@ Write this for arm64 first, then for x86_64.
 4.  **Handling Clobbers:**
     *   When the allocator hits a `Call` MIR instruction, force it to evict all caller-saved registers to the stack.
     *   *Test:* Hand-write MIR with 30 virtual registers. Run the allocator. Check the emitted ASM to ensure stack offsets (`[rbp - 8]`) are used correctly.
+
+```
+# TODO:
 
 ---
 

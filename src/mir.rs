@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetArch {
     Arm64,
+    Amd64,
     X86_64,
 }
 
@@ -213,6 +214,7 @@ impl Error for EmitError {}
 pub fn emit_assembly(func: &MirFunction, target: TargetArch) -> Result<String, EmitError> {
     match target {
         TargetArch::Arm64 => emit_arm64_assembly(func),
+        TargetArch::Amd64 => emit_x86_64_assembly(func),
         TargetArch::X86_64 => emit_x86_64_assembly(func),
     }
 }
@@ -505,5 +507,22 @@ mod tests {
 
         let err = emit_arm64_assembly(&func).expect_err("expected vreg to fail");
         assert!(err.to_string().contains("virtual register"));
+    }
+
+    #[test]
+    fn amd64_alias_uses_x86_64_emitter() {
+        let func = MirFunction::with_instructions(
+            "main",
+            vec![
+                MirInst::Mov {
+                    dst: Reg::Phys(PhysReg::RAX),
+                    src: Operand::Imm(42),
+                },
+                MirInst::Ret,
+            ],
+        );
+
+        let asm = emit_assembly(&func, TargetArch::Amd64).expect("amd64 emission failed");
+        assert!(asm.contains("movq $42, %rax"));
     }
 }

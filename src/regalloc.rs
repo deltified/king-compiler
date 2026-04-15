@@ -105,9 +105,10 @@ pub fn linear_scan_allocate(
     target: TargetArch,
 ) -> Result<LinearScanAllocation, AllocError> {
     match target {
+        TargetArch::Amd64 => linear_scan_allocate_x86_64(func),
         TargetArch::X86_64 => linear_scan_allocate_x86_64(func),
         TargetArch::Arm64 => Err(AllocError::new(
-            "linear-scan allocation is currently implemented for x86_64",
+            "linear-scan allocation is currently implemented for amd64/x86_64",
         )),
     }
 }
@@ -929,5 +930,30 @@ mod tests {
             saw_load_after_call,
             "expected caller-saved register restore after call"
         );
+    }
+
+    #[test]
+    fn linear_scan_supports_amd64_alias() {
+        let func = MirFunction::with_instructions(
+            "amd64_alias",
+            vec![
+                MirInst::Mov {
+                    dst: Reg::VReg(0),
+                    src: Operand::Imm(5),
+                },
+                MirInst::Mov {
+                    dst: Reg::Phys(PhysReg::RAX),
+                    src: Operand::Reg(Reg::VReg(0)),
+                },
+                MirInst::Ret,
+            ],
+        );
+
+        let allocation =
+            linear_scan_allocate(&func, TargetArch::Amd64).expect("amd64 allocation should work");
+        let asm = emit_x86_64_assembly(&allocation.function).expect("x86_64 emission failed");
+
+        assert!(asm.contains("pushq %rbp"));
+        assert!(asm.contains("ret"));
     }
 }
