@@ -1,3 +1,4 @@
+use king_compiler::ir::build_factorial_il;
 use king_compiler::mir::{
     MirFunction, MirInst, Operand, PhysReg, Reg, TargetArch, emit_arm64_assembly,
     emit_x86_64_assembly,
@@ -50,6 +51,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Wrote test_linear_scan_x86_64.s (stack frame: {} bytes)",
         allocated.stack_size
     );
+
+    let factorial = build_factorial_il()?;
+    let factorial_text = factorial.format_il();
+    std::fs::write("factorial.il", &factorial_text)?;
+    println!("Phase 3 factorial IL:\n{factorial_text}");
 
     Ok(())
 }
