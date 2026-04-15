@@ -1,0 +1,2 @@
+fn add2(a, b) = a + b;
+fn main() = add2(40, 2);
