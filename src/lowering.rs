@@ -330,28 +330,49 @@ pub fn lower_il_to_mir(
                     function: callee,
                     args,
                 } => {
+                    enum PreparedCallArg {
+                        Direct(Operand),
+                        Staged(i32),
+                    }
+
                     if args.len() > arg_regs.len() {
                         return Err(LoweringError::TooManyCallArgs(args.len()));
                     }
 
-                    let mut staged_offsets = Vec::with_capacity(args.len());
+                    let mut call_args = Vec::with_capacity(args.len());
                     for (_, arg_value) in args {
                         let operand = value_operand(function, *arg_value, &value_vregs)?;
-                        let arg_reg = ensure_operand_reg(operand, &mut next_vreg, &mut out);
-                        next_alloca_offset += 8;
-                        let offset = next_alloca_offset;
-                        staged_offsets.push(offset);
-                        out.push(MirInst::StoreStack {
-                            src: arg_reg,
-                            offset,
-                        });
+                        match operand {
+                            // Immediate operands can be materialized directly into ABI arg regs
+                            // without risking source clobbering.
+                            Operand::Imm(imm) => {
+                                call_args.push(PreparedCallArg::Direct(Operand::Imm(imm)))
+                            }
+                            Operand::Reg(_) => {
+                                let arg_reg =
+                                    ensure_operand_reg(operand, &mut next_vreg, &mut out);
+                                next_alloca_offset += 8;
+                                let offset = next_alloca_offset;
+                                out.push(MirInst::StoreStack {
+                                    src: arg_reg,
+                                    offset,
+                                });
+                                call_args.push(PreparedCallArg::Staged(offset));
+                            }
+                        }
                     }
 
-                    for (index, offset) in staged_offsets.into_iter().enumerate() {
-                        out.push(MirInst::LoadStack {
-                            dst: Reg::Phys(arg_regs[index]),
-                            offset,
-                        });
+                    for (index, call_arg) in call_args.into_iter().enumerate() {
+                        match call_arg {
+                            PreparedCallArg::Staged(offset) => out.push(MirInst::LoadStack {
+                                dst: Reg::Phys(arg_regs[index]),
+                                offset,
+                            }),
+                            PreparedCallArg::Direct(operand) => out.push(MirInst::Mov {
+                                dst: Reg::Phys(arg_regs[index]),
+                                src: operand,
+                            }),
+                        }
                     }
 
                     out.push(MirInst::Call {
@@ -636,37 +657,31 @@ fn lower_integer_binop(
     let rhs_operand = value_operand(function, rhs, value_vregs)?;
 
     let lhs_reg = ensure_operand_reg(lhs_operand, next_vreg, out);
-    if lhs_reg != dst {
-        out.push(MirInst::Mov {
-            dst,
-            src: Operand::Reg(lhs_reg),
-        });
-    }
 
     match op {
         IntBinOp::Add => out.push(MirInst::Add {
             dst,
-            lhs: dst,
+            lhs: lhs_reg,
             rhs: rhs_operand,
         }),
         IntBinOp::Sub => out.push(MirInst::Sub {
             dst,
-            lhs: dst,
+            lhs: lhs_reg,
             rhs: rhs_operand,
         }),
         IntBinOp::And => out.push(MirInst::And {
             dst,
-            lhs: dst,
+            lhs: lhs_reg,
             rhs: rhs_operand,
         }),
         IntBinOp::Mul => out.push(MirInst::Mul {
             dst,
-            lhs: dst,
+            lhs: lhs_reg,
             rhs: rhs_operand,
         }),
         IntBinOp::Sdiv => out.push(MirInst::Sdiv {
             dst,
-            lhs: dst,
+            lhs: lhs_reg,
             rhs: rhs_operand,
         }),
     }

@@ -423,6 +423,15 @@ pub fn emit_x86_64_assembly(func: &MirFunction) -> Result<String, EmitError> {
                 let dst_name = x86_64_reg(*dst)?;
                 let lhs_name = x86_64_reg(*lhs)?;
 
+                let mut rhs_override = None;
+                if let Operand::Reg(reg) = rhs {
+                    let rhs_name = x86_64_reg(*reg)?;
+                    if rhs_name == "%rax" && lhs_name != "%rax" {
+                        out.push_str("    movq %rax, %r11\n");
+                        rhs_override = Some("%r11");
+                    }
+                }
+
                 if lhs_name != "%rax" {
                     out.push_str(&format!("    movq {}, %rax\n", lhs_name));
                 }
@@ -431,8 +440,12 @@ pub fn emit_x86_64_assembly(func: &MirFunction) -> Result<String, EmitError> {
 
                 match rhs {
                     Operand::Reg(reg) => {
-                        let rhs = x86_64_reg(*reg)?;
-                        out.push_str(&format!("    idivq {}\n", rhs));
+                        if let Some(rhs) = rhs_override {
+                            out.push_str(&format!("    idivq {}\n", rhs));
+                        } else {
+                            let rhs = x86_64_reg(*reg)?;
+                            out.push_str(&format!("    idivq {}\n", rhs));
+                        }
                     }
                     Operand::Imm(imm) => {
                         out.push_str(&format!("    movq ${}, %r11\n", imm));

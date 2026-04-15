@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-
 use crate::mir::{MirFunction, MirInst, Operand, PhysReg, Reg, TargetArch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,36 +189,134 @@ pub fn linear_scan_allocate(
 
 fn linear_scan_allocate_arm64(func: &MirFunction) -> Result<LinearScanAllocation, AllocError> {
     let intervals = compute_live_intervals(func);
+    let allocatable = allocatable_arm64_registers();
     let preexisting_stack = max_preexisting_stack_offset(func);
 
-    let mut allocations = BTreeMap::new();
-    let mut next_stack_offset = preexisting_stack;
+    let mut working: HashMap<usize, WorkingAlloc> = HashMap::new();
+    let mut active: Vec<ActiveInterval> = Vec::new();
+    let mut free_regs = allocatable.to_vec();
+    let mut next_stack_offset: i32 = preexisting_stack;
 
     for interval in &intervals {
-        next_stack_offset += 8;
-        allocations.insert(
-            interval.vreg,
-            VRegAllocation {
-                reg: None,
-                stack_offset: Some(next_stack_offset),
-            },
-        );
+        expire_old_intervals(interval.start, &mut active, &mut free_regs, allocatable);
+
+        if active.len() >= allocatable.len() {
+            let (spill_index, spill_candidate) = active
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, candidate)| candidate.end)
+                .map(|(index, candidate)| (index, *candidate))
+                .ok_or_else(|| AllocError::new("internal allocator error: no active candidate"))?;
+
+            if spill_candidate.end > interval.end {
+                active.remove(spill_index);
+
+                let spilled = working.entry(spill_candidate.vreg).or_default();
+                spilled.reg = None;
+                ensure_stack_slot(spill_candidate.vreg, &mut working, &mut next_stack_offset);
+
+                let current = working.entry(interval.vreg).or_default();
+                current.reg = Some(spill_candidate.reg);
+
+                active.push(ActiveInterval {
+                    vreg: interval.vreg,
+                    end: interval.end,
+                    reg: spill_candidate.reg,
+                });
+                active.sort_by_key(|candidate| candidate.end);
+            } else {
+                let current = working.entry(interval.vreg).or_default();
+                current.reg = None;
+                ensure_stack_slot(interval.vreg, &mut working, &mut next_stack_offset);
+            }
+        } else {
+            let reg = free_regs.first().copied().ok_or_else(|| {
+                AllocError::new("internal allocator error: free register missing")
+            })?;
+            free_regs.remove(0);
+
+            let current = working.entry(interval.vreg).or_default();
+            current.reg = Some(reg);
+
+            active.push(ActiveInterval {
+                vreg: interval.vreg,
+                end: interval.end,
+                reg,
+            });
+            active.sort_by_key(|candidate| candidate.end);
+        }
     }
 
-    // Reserve frame-pointer and link-register spill slots beyond all user/lowering stack slots.
-    let saved_fp_offset = next_stack_offset + 8;
-    let saved_lr_offset = next_stack_offset + 16;
-    let raw_stack_size = saved_lr_offset as usize;
-    let stack_size = ((raw_stack_size + 15) / 16) * 16;
+    // Any caller-saved vreg live across a call gets a stack home so we can
+    // explicitly evict/restore around call sites.
+    for (index, inst) in func.instructions.iter().enumerate() {
+        if !matches!(inst, MirInst::Call { .. }) {
+            continue;
+        }
+
+        for interval in &intervals {
+            if !interval.contains(index) {
+                continue;
+            }
+
+            let reg = working
+                .get(&interval.vreg)
+                .ok_or_else(|| AllocError::new("interval has no allocation state"))?
+                .reg;
+            if let Some(reg) = reg
+                && is_arm64_caller_saved(reg)
+            {
+                if reg == PhysReg::X0 {
+                    // Call results are returned in X0. Keeping a live-across-call
+                    // value in X0 would force a restore that can clobber the
+                    // callee return value before it is consumed.
+                    let state = working
+                        .get_mut(&interval.vreg)
+                        .ok_or_else(|| AllocError::new("interval has no allocation state"))?;
+                    state.reg = None;
+                }
+
+                ensure_stack_slot(interval.vreg, &mut working, &mut next_stack_offset);
+            }
+        }
+    }
+
+    let has_call = func
+        .instructions
+        .iter()
+        .any(|inst| matches!(inst, MirInst::Call { .. }));
+    let raw_stack_size = next_stack_offset.max(0) as usize;
+    let (saved_fp_offset, saved_lr_offset, stack_size) = if raw_stack_size > 0 || has_call {
+        // Reserve frame-pointer and link-register spill slots beyond all user/lowering stack slots.
+        let saved_fp_offset = next_stack_offset + 8;
+        let saved_lr_offset = next_stack_offset + 16;
+        let raw_with_frame = saved_lr_offset as usize;
+        let stack_size = ((raw_with_frame + 15) / 16) * 16;
+        (Some(saved_fp_offset), Some(saved_lr_offset), stack_size)
+    } else {
+        (None, None, 0)
+    };
 
     let lowered = rewrite_with_allocations_arm64(
         func,
-        &allocations,
+        &intervals,
+        &working,
         stack_size,
         saved_fp_offset,
         saved_lr_offset,
     )?;
     let allocated_func = MirFunction::with_instructions(func.name.clone(), lowered);
+
+    let mut allocations = BTreeMap::new();
+    for (vreg, state) in &working {
+        allocations.insert(
+            *vreg,
+            VRegAllocation {
+                reg: state.reg,
+                stack_offset: state.stack_offset,
+            },
+        );
+    }
 
     Ok(LinearScanAllocation {
         function: allocated_func,
@@ -231,40 +328,47 @@ fn linear_scan_allocate_arm64(func: &MirFunction) -> Result<LinearScanAllocation
 
 fn rewrite_with_allocations_arm64(
     func: &MirFunction,
-    allocations: &BTreeMap<usize, VRegAllocation>,
+    intervals: &[LiveInterval],
+    allocations: &HashMap<usize, WorkingAlloc>,
     stack_size: usize,
-    saved_fp_offset: i32,
-    saved_lr_offset: i32,
+    saved_fp_offset: Option<i32>,
+    saved_lr_offset: Option<i32>,
 ) -> Result<Vec<MirInst>, AllocError> {
     let mut out = Vec::new();
+    let has_frame = stack_size > 0;
 
-    // Preserve caller frame pointer before we repurpose x29 as our frame base.
-    out.push(MirInst::Mov {
-        dst: Reg::Phys(PhysReg::X16),
-        src: Operand::Reg(Reg::Phys(PhysReg::X29)),
-    });
-    if stack_size > 0 {
+    if has_frame {
+        let saved_fp_offset = saved_fp_offset
+            .ok_or_else(|| AllocError::new("missing saved frame-pointer slot for arm64"))?;
+        let saved_lr_offset = saved_lr_offset
+            .ok_or_else(|| AllocError::new("missing saved link-register slot for arm64"))?;
+
+        // Preserve caller frame pointer before we repurpose x29 as our frame base.
+        out.push(MirInst::Mov {
+            dst: Reg::Phys(PhysReg::X16),
+            src: Operand::Reg(Reg::Phys(PhysReg::X29)),
+        });
         out.push(MirInst::Sub {
             dst: Reg::Phys(PhysReg::SP),
             lhs: Reg::Phys(PhysReg::SP),
             rhs: Operand::Imm(stack_size as i64),
         });
+        out.push(MirInst::Add {
+            dst: Reg::Phys(PhysReg::X29),
+            lhs: Reg::Phys(PhysReg::SP),
+            rhs: Operand::Imm(stack_size as i64),
+        });
+        out.push(MirInst::StoreStack {
+            src: Reg::Phys(PhysReg::X16),
+            offset: saved_fp_offset,
+        });
+        out.push(MirInst::StoreStack {
+            src: Reg::Phys(PhysReg::X30),
+            offset: saved_lr_offset,
+        });
     }
-    out.push(MirInst::Add {
-        dst: Reg::Phys(PhysReg::X29),
-        lhs: Reg::Phys(PhysReg::SP),
-        rhs: Operand::Imm(stack_size as i64),
-    });
-    out.push(MirInst::StoreStack {
-        src: Reg::Phys(PhysReg::X16),
-        offset: saved_fp_offset,
-    });
-    out.push(MirInst::StoreStack {
-        src: Reg::Phys(PhysReg::X30),
-        offset: saved_lr_offset,
-    });
 
-    for inst in &func.instructions {
+    for (index, inst) in func.instructions.iter().enumerate() {
         match inst {
             MirInst::Label(label) => out.push(MirInst::Label(label.clone())),
             MirInst::Mov { dst, src } => {
@@ -331,19 +435,61 @@ fn rewrite_with_allocations_arm64(
                 cond: *cond,
                 label: label.clone(),
             }),
-            MirInst::Call { symbol } => out.push(MirInst::Call {
-                symbol: symbol.clone(),
-            }),
+            MirInst::Call { symbol } => {
+                let mut live = Vec::new();
+                for interval in intervals {
+                    if !interval.contains(index) {
+                        continue;
+                    }
+
+                    if let Some(state) = allocations.get(&interval.vreg)
+                        && let (Some(reg), Some(offset)) = (state.reg, state.stack_offset)
+                        && is_arm64_caller_saved(reg)
+                    {
+                        live.push((interval.vreg, reg, offset, interval.end > index));
+                    }
+                }
+
+                live.sort_by_key(|(vreg, _, _, _)| *vreg);
+
+                for (_, reg, offset, _) in &live {
+                    out.push(MirInst::StoreStack {
+                        src: Reg::Phys(*reg),
+                        offset: *offset,
+                    });
+                }
+
+                out.push(MirInst::Call {
+                    symbol: symbol.clone(),
+                });
+
+                for (_, reg, offset, needs_restore) in &live {
+                    if !needs_restore {
+                        continue;
+                    }
+                    out.push(MirInst::LoadStack {
+                        dst: Reg::Phys(*reg),
+                        offset: *offset,
+                    });
+                }
+            }
             MirInst::Ret => {
-                out.push(MirInst::LoadStack {
-                    dst: Reg::Phys(PhysReg::X30),
-                    offset: saved_lr_offset,
-                });
-                out.push(MirInst::LoadStack {
-                    dst: Reg::Phys(PhysReg::X29),
-                    offset: saved_fp_offset,
-                });
-                if stack_size > 0 {
+                if has_frame {
+                    let saved_fp_offset = saved_fp_offset.ok_or_else(|| {
+                        AllocError::new("missing saved frame-pointer slot for arm64")
+                    })?;
+                    let saved_lr_offset = saved_lr_offset.ok_or_else(|| {
+                        AllocError::new("missing saved link-register slot for arm64")
+                    })?;
+
+                    out.push(MirInst::LoadStack {
+                        dst: Reg::Phys(PhysReg::X30),
+                        offset: saved_lr_offset,
+                    });
+                    out.push(MirInst::LoadStack {
+                        dst: Reg::Phys(PhysReg::X29),
+                        offset: saved_fp_offset,
+                    });
                     out.push(MirInst::Add {
                         dst: Reg::Phys(PhysReg::SP),
                         lhs: Reg::Phys(PhysReg::SP),
@@ -360,45 +506,259 @@ fn rewrite_with_allocations_arm64(
         }
     }
 
-    Ok(out)
+    Ok(peephole_optimize_arm64(out))
+}
+
+fn peephole_optimize_arm64(instructions: Vec<MirInst>) -> Vec<MirInst> {
+    let mut simplified = Vec::with_capacity(instructions.len());
+    let mut index = 0;
+
+    while index < instructions.len() {
+        if let Some((rewritten, consumed)) = try_fold_arm64_arith_result_move(&instructions, index)
+        {
+            simplified.push(rewritten);
+            index += consumed;
+            continue;
+        }
+
+        match &instructions[index] {
+            MirInst::Mov {
+                dst,
+                src: Operand::Reg(src_reg),
+            } => {
+                if dst == src_reg {
+                    index += 1;
+                    continue;
+                }
+
+                if index + 1 < instructions.len()
+                    && let MirInst::Mov {
+                        dst: next_dst,
+                        src: Operand::Reg(next_src),
+                    } = &instructions[index + 1]
+                    && next_dst == src_reg
+                    && next_src == dst
+                {
+                    simplified.push(instructions[index].clone());
+                    index += 2;
+                    continue;
+                }
+
+                simplified.push(instructions[index].clone());
+                index += 1;
+            }
+            _ => {
+                simplified.push(instructions[index].clone());
+                index += 1;
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(simplified.len());
+    for (idx, inst) in simplified.iter().enumerate() {
+        let is_dead_move = matches!(
+            inst,
+            MirInst::Mov {
+                dst,
+                src: Operand::Reg(_)
+            } if move_destination_is_dead_arm64(&simplified, idx, *dst)
+        );
+
+        if !is_dead_move {
+            out.push(inst.clone());
+        }
+    }
+
+    out
+}
+
+fn try_fold_arm64_arith_result_move(
+    instructions: &[MirInst],
+    index: usize,
+) -> Option<(MirInst, usize)> {
+    let current = instructions.get(index)?;
+    let next = instructions.get(index + 1)?;
+
+    let arith_dst = match current {
+        MirInst::Add { dst, .. }
+        | MirInst::Sub { dst, .. }
+        | MirInst::And { dst, .. }
+        | MirInst::Mul { dst, .. }
+        | MirInst::Sdiv { dst, .. } => *dst,
+        _ => return None,
+    };
+
+    let MirInst::Mov {
+        dst: mov_dst,
+        src: Operand::Reg(mov_src),
+    } = next
+    else {
+        return None;
+    };
+
+    if *mov_src != arith_dst {
+        return None;
+    }
+
+    if !move_destination_is_dead_arm64(instructions, index + 1, arith_dst) {
+        return None;
+    }
+
+    let rewritten = match current {
+        MirInst::Add { lhs, rhs, .. } => MirInst::Add {
+            dst: *mov_dst,
+            lhs: *lhs,
+            rhs: rhs.clone(),
+        },
+        MirInst::Sub { lhs, rhs, .. } => MirInst::Sub {
+            dst: *mov_dst,
+            lhs: *lhs,
+            rhs: rhs.clone(),
+        },
+        MirInst::And { lhs, rhs, .. } => MirInst::And {
+            dst: *mov_dst,
+            lhs: *lhs,
+            rhs: rhs.clone(),
+        },
+        MirInst::Mul { lhs, rhs, .. } => MirInst::Mul {
+            dst: *mov_dst,
+            lhs: *lhs,
+            rhs: rhs.clone(),
+        },
+        MirInst::Sdiv { lhs, rhs, .. } => MirInst::Sdiv {
+            dst: *mov_dst,
+            lhs: *lhs,
+            rhs: rhs.clone(),
+        },
+        _ => return None,
+    };
+
+    Some((rewritten, 2))
+}
+
+fn move_destination_is_dead_arm64(instructions: &[MirInst], move_index: usize, dst: Reg) -> bool {
+    for inst in instructions.iter().skip(move_index + 1) {
+        match inst {
+            MirInst::Label(_) | MirInst::Jmp { .. } | MirInst::JmpIf { .. } | MirInst::Call { .. } => {
+                return false;
+            }
+            MirInst::Ret => {
+                return dst != Reg::Phys(PhysReg::X0);
+            }
+            _ => {
+                if inst_reads_reg_arm64(inst, dst) {
+                    return false;
+                }
+                if inst_writes_reg_arm64(inst, dst) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn inst_reads_reg_arm64(inst: &MirInst, reg: Reg) -> bool {
+    match inst {
+        MirInst::Mov { src, .. } => matches!(src, Operand::Reg(src_reg) if *src_reg == reg),
+        MirInst::Add { lhs, rhs, .. }
+        | MirInst::Sub { lhs, rhs, .. }
+        | MirInst::And { lhs, rhs, .. }
+        | MirInst::Mul { lhs, rhs, .. }
+        | MirInst::Sdiv { lhs, rhs, .. } => {
+            *lhs == reg || matches!(rhs, Operand::Reg(rhs_reg) if *rhs_reg == reg)
+        }
+        MirInst::Cmp { lhs, rhs } => {
+            *lhs == reg || matches!(rhs, Operand::Reg(rhs_reg) if *rhs_reg == reg)
+        }
+        MirInst::Push { src } | MirInst::StoreStack { src, .. } => *src == reg,
+        MirInst::Label(_)
+        | MirInst::Pop { .. }
+        | MirInst::LoadStack { .. }
+        | MirInst::Jmp { .. }
+        | MirInst::JmpIf { .. }
+        | MirInst::Call { .. }
+        | MirInst::Ret => false,
+    }
+}
+
+fn inst_writes_reg_arm64(inst: &MirInst, reg: Reg) -> bool {
+    match inst {
+        MirInst::Mov { dst, .. }
+        | MirInst::Add { dst, .. }
+        | MirInst::Sub { dst, .. }
+        | MirInst::And { dst, .. }
+        | MirInst::Mul { dst, .. }
+        | MirInst::Sdiv { dst, .. }
+        | MirInst::LoadStack { dst, .. }
+        | MirInst::Pop { dst } => *dst == reg,
+        MirInst::Label(_)
+        | MirInst::Cmp { .. }
+        | MirInst::Push { .. }
+        | MirInst::StoreStack { .. }
+        | MirInst::Jmp { .. }
+        | MirInst::JmpIf { .. }
+        | MirInst::Call { .. }
+        | MirInst::Ret => false,
+    }
 }
 
 fn lower_mov_arm64(
     dst: Reg,
     src: &Operand,
-    allocations: &BTreeMap<usize, VRegAllocation>,
+    allocations: &HashMap<usize, WorkingAlloc>,
 ) -> Result<Vec<MirInst>, AllocError> {
     let mut out = Vec::new();
     let resolved_src = resolve_operand_use_arm64(src.clone(), allocations, &mut out)?;
 
     match dst {
-        Reg::Phys(phys) => out.push(MirInst::Mov {
-            dst: Reg::Phys(phys),
-            src: resolved_src,
-        }),
+        Reg::Phys(phys) => {
+            let dst_reg = Reg::Phys(phys);
+            if !is_identity_move(dst_reg, &resolved_src) {
+                out.push(MirInst::Mov {
+                    dst: dst_reg,
+                    src: resolved_src,
+                });
+            }
+        }
         Reg::VReg(vreg) => {
-            let slot = slot_for_vreg(vreg, allocations)?;
-            match resolved_src {
-                Operand::Reg(Reg::Phys(src_phys)) => {
-                    out.push(MirInst::StoreStack {
-                        src: Reg::Phys(src_phys),
-                        offset: slot,
-                    });
-                }
-                Operand::Imm(imm) => {
+            let alloc = get_alloc(vreg, allocations)?;
+            if let Some(phys) = alloc.reg {
+                let dst_reg = Reg::Phys(phys);
+                if !is_identity_move(dst_reg, &resolved_src) {
                     out.push(MirInst::Mov {
-                        dst: Reg::Phys(PhysReg::X16),
-                        src: Operand::Imm(imm),
-                    });
-                    out.push(MirInst::StoreStack {
-                        src: Reg::Phys(PhysReg::X16),
-                        offset: slot,
+                        dst: dst_reg,
+                        src: resolved_src,
                     });
                 }
-                Operand::Reg(Reg::VReg(_)) => {
-                    return Err(AllocError::new(
-                        "resolved arm64 operand still contains virtual register",
-                    ));
+            } else {
+                let slot = alloc
+                    .stack_offset
+                    .ok_or_else(|| AllocError::new("spilled arm64 vreg is missing a stack slot"))?;
+
+                match resolved_src {
+                    Operand::Reg(Reg::Phys(src_phys)) => {
+                        out.push(MirInst::StoreStack {
+                            src: Reg::Phys(src_phys),
+                            offset: slot,
+                        });
+                    }
+                    Operand::Imm(imm) => {
+                        out.push(MirInst::Mov {
+                            dst: Reg::Phys(PhysReg::X16),
+                            src: Operand::Imm(imm),
+                        });
+                        out.push(MirInst::StoreStack {
+                            src: Reg::Phys(PhysReg::X16),
+                            offset: slot,
+                        });
+                    }
+                    Operand::Reg(Reg::VReg(_)) => {
+                        return Err(AllocError::new(
+                            "resolved arm64 operand still contains virtual register",
+                        ));
+                    }
                 }
             }
         }
@@ -412,7 +772,7 @@ fn lower_arithmetic_arm64(
     dst: Reg,
     lhs: Reg,
     rhs: &Operand,
-    allocations: &BTreeMap<usize, VRegAllocation>,
+    allocations: &HashMap<usize, WorkingAlloc>,
 ) -> Result<Vec<MirInst>, AllocError> {
     let mut out = Vec::new();
 
@@ -431,10 +791,17 @@ fn lower_arithmetic_arm64(
 
     let (dst_reg, dst_slot) = match dst {
         Reg::Phys(phys) => (Reg::Phys(phys), None),
-        Reg::VReg(vreg) => (
-            Reg::Phys(PhysReg::X15),
-            Some(slot_for_vreg(vreg, allocations)?),
-        ),
+        Reg::VReg(vreg) => {
+            let alloc = get_alloc(vreg, allocations)?;
+            if let Some(phys) = alloc.reg {
+                (Reg::Phys(phys), None)
+            } else {
+                let slot = alloc.stack_offset.ok_or_else(|| {
+                    AllocError::new("spilled arm64 vreg is missing a stack slot")
+                })?;
+                (Reg::Phys(PhysReg::X15), Some(slot))
+            }
+        }
     };
 
     out.push(match op {
@@ -478,7 +845,7 @@ fn lower_arithmetic_arm64(
 fn lower_cmp_arm64(
     lhs: Reg,
     rhs: &Operand,
-    allocations: &BTreeMap<usize, VRegAllocation>,
+    allocations: &HashMap<usize, WorkingAlloc>,
 ) -> Result<Vec<MirInst>, AllocError> {
     let mut out = Vec::new();
     let lhs_reg = resolve_use_reg_arm64(lhs, allocations, &mut out, PhysReg::X16)?;
@@ -493,7 +860,7 @@ fn lower_cmp_arm64(
 fn lower_load_stack_arm64(
     dst: Reg,
     offset: i32,
-    allocations: &BTreeMap<usize, VRegAllocation>,
+    allocations: &HashMap<usize, WorkingAlloc>,
 ) -> Result<Vec<MirInst>, AllocError> {
     let mut out = Vec::new();
 
@@ -503,15 +870,25 @@ fn lower_load_stack_arm64(
             offset,
         }),
         Reg::VReg(vreg) => {
-            let slot = slot_for_vreg(vreg, allocations)?;
-            out.push(MirInst::LoadStack {
-                dst: Reg::Phys(PhysReg::X16),
-                offset,
-            });
-            out.push(MirInst::StoreStack {
-                src: Reg::Phys(PhysReg::X16),
-                offset: slot,
-            });
+            let alloc = get_alloc(vreg, allocations)?;
+            if let Some(phys) = alloc.reg {
+                out.push(MirInst::LoadStack {
+                    dst: Reg::Phys(phys),
+                    offset,
+                });
+            } else {
+                let slot = alloc.stack_offset.ok_or_else(|| {
+                    AllocError::new("spilled arm64 vreg is missing a stack slot")
+                })?;
+                out.push(MirInst::LoadStack {
+                    dst: Reg::Phys(PhysReg::X16),
+                    offset,
+                });
+                out.push(MirInst::StoreStack {
+                    src: Reg::Phys(PhysReg::X16),
+                    offset: slot,
+                });
+            }
         }
     }
 
@@ -521,7 +898,7 @@ fn lower_load_stack_arm64(
 fn lower_store_stack_arm64(
     src: Reg,
     offset: i32,
-    allocations: &BTreeMap<usize, VRegAllocation>,
+    allocations: &HashMap<usize, WorkingAlloc>,
 ) -> Result<Vec<MirInst>, AllocError> {
     let mut out = Vec::new();
 
@@ -531,15 +908,25 @@ fn lower_store_stack_arm64(
             offset,
         }),
         Reg::VReg(vreg) => {
-            let slot = slot_for_vreg(vreg, allocations)?;
-            out.push(MirInst::LoadStack {
-                dst: Reg::Phys(PhysReg::X16),
-                offset: slot,
-            });
-            out.push(MirInst::StoreStack {
-                src: Reg::Phys(PhysReg::X16),
-                offset,
-            });
+            let alloc = get_alloc(vreg, allocations)?;
+            if let Some(phys) = alloc.reg {
+                out.push(MirInst::StoreStack {
+                    src: Reg::Phys(phys),
+                    offset,
+                });
+            } else {
+                let slot = alloc.stack_offset.ok_or_else(|| {
+                    AllocError::new("spilled arm64 vreg is missing a stack slot")
+                })?;
+                out.push(MirInst::LoadStack {
+                    dst: Reg::Phys(PhysReg::X16),
+                    offset: slot,
+                });
+                out.push(MirInst::StoreStack {
+                    src: Reg::Phys(PhysReg::X16),
+                    offset,
+                });
+            }
         }
     }
 
@@ -548,26 +935,33 @@ fn lower_store_stack_arm64(
 
 fn resolve_use_reg_arm64(
     reg: Reg,
-    allocations: &BTreeMap<usize, VRegAllocation>,
+    allocations: &HashMap<usize, WorkingAlloc>,
     out: &mut Vec<MirInst>,
     scratch: PhysReg,
 ) -> Result<Reg, AllocError> {
     match reg {
         Reg::Phys(phys) => Ok(Reg::Phys(phys)),
         Reg::VReg(vreg) => {
-            let slot = slot_for_vreg(vreg, allocations)?;
-            out.push(MirInst::LoadStack {
-                dst: Reg::Phys(scratch),
-                offset: slot,
-            });
-            Ok(Reg::Phys(scratch))
+            let alloc = get_alloc(vreg, allocations)?;
+            if let Some(phys) = alloc.reg {
+                Ok(Reg::Phys(phys))
+            } else {
+                let slot = alloc.stack_offset.ok_or_else(|| {
+                    AllocError::new("spilled arm64 vreg is missing a stack slot")
+                })?;
+                out.push(MirInst::LoadStack {
+                    dst: Reg::Phys(scratch),
+                    offset: slot,
+                });
+                Ok(Reg::Phys(scratch))
+            }
         }
     }
 }
 
 fn resolve_operand_use_arm64(
     operand: Operand,
-    allocations: &BTreeMap<usize, VRegAllocation>,
+    allocations: &HashMap<usize, WorkingAlloc>,
     out: &mut Vec<MirInst>,
 ) -> Result<Operand, AllocError> {
     match operand {
@@ -577,16 +971,6 @@ fn resolve_operand_use_arm64(
             Ok(Operand::Reg(resolved))
         }
     }
-}
-
-fn slot_for_vreg(
-    vreg: usize,
-    allocations: &BTreeMap<usize, VRegAllocation>,
-) -> Result<i32, AllocError> {
-    allocations
-        .get(&vreg)
-        .and_then(|entry| entry.stack_offset)
-        .ok_or_else(|| AllocError::new(format!("missing stack slot for arm64 v{vreg}")))
 }
 
 fn linear_scan_allocate_x86_64(func: &MirFunction) -> Result<LinearScanAllocation, AllocError> {
@@ -661,10 +1045,11 @@ fn linear_scan_allocate_x86_64(func: &MirFunction) -> Result<LinearScanAllocatio
                 continue;
             }
 
-            let state = working
+            let reg = working
                 .get(&interval.vreg)
-                .ok_or_else(|| AllocError::new("interval has no allocation state"))?;
-            if let Some(reg) = state.reg
+                .ok_or_else(|| AllocError::new("interval has no allocation state"))?
+                .reg;
+            if let Some(reg) = reg
                 && is_x86_64_caller_saved(reg)
             {
                 ensure_stack_slot(interval.vreg, &mut working, &mut next_stack_offset);
@@ -707,25 +1092,32 @@ fn rewrite_with_allocations_x86_64(
     callee_saved: &[PhysReg],
 ) -> Result<Vec<MirInst>, AllocError> {
     let mut out = Vec::new();
+    let has_call = func
+        .instructions
+        .iter()
+        .any(|inst| matches!(inst, MirInst::Call { .. }));
+    let omit_frame = stack_size == 0 && callee_saved.is_empty() && !has_call;
 
-    out.push(MirInst::Push {
-        src: Reg::Phys(PhysReg::RBP),
-    });
-    for reg in callee_saved {
+    if !omit_frame {
         out.push(MirInst::Push {
-            src: Reg::Phys(*reg),
+            src: Reg::Phys(PhysReg::RBP),
         });
-    }
-    out.push(MirInst::Mov {
-        dst: Reg::Phys(PhysReg::RBP),
-        src: Operand::Reg(Reg::Phys(PhysReg::RSP)),
-    });
-    if stack_size > 0 {
-        out.push(MirInst::Sub {
-            dst: Reg::Phys(PhysReg::RSP),
-            lhs: Reg::Phys(PhysReg::RSP),
-            rhs: Operand::Imm(stack_size as i64),
+        for reg in callee_saved {
+            out.push(MirInst::Push {
+                src: Reg::Phys(*reg),
+            });
+        }
+        out.push(MirInst::Mov {
+            dst: Reg::Phys(PhysReg::RBP),
+            src: Operand::Reg(Reg::Phys(PhysReg::RSP)),
         });
+        if stack_size > 0 {
+            out.push(MirInst::Sub {
+                dst: Reg::Phys(PhysReg::RSP),
+                lhs: Reg::Phys(PhysReg::RSP),
+                rhs: Operand::Imm(stack_size as i64),
+            });
+        }
     }
 
     for (index, inst) in func.instructions.iter().enumerate() {
@@ -834,21 +1226,23 @@ fn rewrite_with_allocations_x86_64(
                 }
             }
             MirInst::Ret => {
-                if stack_size > 0 {
-                    out.push(MirInst::Add {
-                        dst: Reg::Phys(PhysReg::RSP),
-                        lhs: Reg::Phys(PhysReg::RSP),
-                        rhs: Operand::Imm(stack_size as i64),
-                    });
-                }
-                for reg in callee_saved.iter().rev() {
+                if !omit_frame {
+                    if stack_size > 0 {
+                        out.push(MirInst::Add {
+                            dst: Reg::Phys(PhysReg::RSP),
+                            lhs: Reg::Phys(PhysReg::RSP),
+                            rhs: Operand::Imm(stack_size as i64),
+                        });
+                    }
+                    for reg in callee_saved.iter().rev() {
+                        out.push(MirInst::Pop {
+                            dst: Reg::Phys(*reg),
+                        });
+                    }
                     out.push(MirInst::Pop {
-                        dst: Reg::Phys(*reg),
+                        dst: Reg::Phys(PhysReg::RBP),
                     });
                 }
-                out.push(MirInst::Pop {
-                    dst: Reg::Phys(PhysReg::RBP),
-                });
                 out.push(MirInst::Ret);
             }
             MirInst::Push { src } | MirInst::Pop { dst: src } => {
@@ -862,7 +1256,131 @@ fn rewrite_with_allocations_x86_64(
         }
     }
 
-    Ok(out)
+    Ok(peephole_optimize_x86_64(out))
+}
+
+fn peephole_optimize_x86_64(instructions: Vec<MirInst>) -> Vec<MirInst> {
+    let mut simplified = Vec::with_capacity(instructions.len());
+    let mut index = 0;
+
+    while index < instructions.len() {
+        match &instructions[index] {
+            MirInst::Mov {
+                dst,
+                src: Operand::Reg(src_reg),
+            } => {
+                if dst == src_reg {
+                    index += 1;
+                    continue;
+                }
+
+                if index + 1 < instructions.len()
+                    && let MirInst::Mov {
+                        dst: next_dst,
+                        src: Operand::Reg(next_src),
+                    } = &instructions[index + 1]
+                    && next_dst == src_reg
+                    && next_src == dst
+                {
+                    simplified.push(instructions[index].clone());
+                    index += 2;
+                    continue;
+                }
+
+                simplified.push(instructions[index].clone());
+                index += 1;
+            }
+            _ => {
+                simplified.push(instructions[index].clone());
+                index += 1;
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(simplified.len());
+    for (idx, inst) in simplified.iter().enumerate() {
+        let is_dead_move = matches!(
+            inst,
+            MirInst::Mov {
+                dst,
+                src: Operand::Reg(_)
+            } if move_destination_is_dead_x86_64(&simplified, idx, *dst)
+        );
+
+        if !is_dead_move {
+            out.push(inst.clone());
+        }
+    }
+
+    out
+}
+
+fn move_destination_is_dead_x86_64(instructions: &[MirInst], move_index: usize, dst: Reg) -> bool {
+    for inst in instructions.iter().skip(move_index + 1) {
+        match inst {
+            MirInst::Label(_) | MirInst::Jmp { .. } | MirInst::JmpIf { .. } | MirInst::Call { .. } => {
+                return false;
+            }
+            MirInst::Ret => {
+                return dst != Reg::Phys(PhysReg::RAX);
+            }
+            _ => {
+                if inst_reads_reg_x86_64(inst, dst) {
+                    return false;
+                }
+                if inst_writes_reg_x86_64(inst, dst) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn inst_reads_reg_x86_64(inst: &MirInst, reg: Reg) -> bool {
+    match inst {
+        MirInst::Mov { src, .. } => matches!(src, Operand::Reg(src_reg) if *src_reg == reg),
+        MirInst::Add { lhs, rhs, .. }
+        | MirInst::Sub { lhs, rhs, .. }
+        | MirInst::And { lhs, rhs, .. }
+        | MirInst::Mul { lhs, rhs, .. }
+        | MirInst::Sdiv { lhs, rhs, .. } => {
+            *lhs == reg || matches!(rhs, Operand::Reg(rhs_reg) if *rhs_reg == reg)
+        }
+        MirInst::Cmp { lhs, rhs } => {
+            *lhs == reg || matches!(rhs, Operand::Reg(rhs_reg) if *rhs_reg == reg)
+        }
+        MirInst::Push { src } | MirInst::StoreStack { src, .. } => *src == reg,
+        MirInst::Label(_)
+        | MirInst::Pop { .. }
+        | MirInst::LoadStack { .. }
+        | MirInst::Jmp { .. }
+        | MirInst::JmpIf { .. }
+        | MirInst::Call { .. }
+        | MirInst::Ret => false,
+    }
+}
+
+fn inst_writes_reg_x86_64(inst: &MirInst, reg: Reg) -> bool {
+    match inst {
+        MirInst::Mov { dst, .. }
+        | MirInst::Add { dst, .. }
+        | MirInst::Sub { dst, .. }
+        | MirInst::And { dst, .. }
+        | MirInst::Mul { dst, .. }
+        | MirInst::Sdiv { dst, .. }
+        | MirInst::LoadStack { dst, .. }
+        | MirInst::Pop { dst } => *dst == reg,
+        MirInst::Label(_)
+        | MirInst::Cmp { .. }
+        | MirInst::Push { .. }
+        | MirInst::StoreStack { .. }
+        | MirInst::Jmp { .. }
+        | MirInst::JmpIf { .. }
+        | MirInst::Call { .. }
+        | MirInst::Ret => false,
+    }
 }
 
 fn lower_mov_x86_64(
@@ -884,18 +1402,24 @@ fn lower_mov_x86_64(
 
     match dst {
         Reg::Phys(phys) => {
-            out.push(MirInst::Mov {
-                dst: Reg::Phys(phys),
-                src: resolved_src.operand,
-            });
+            let dst_reg = Reg::Phys(phys);
+            if !is_identity_move(dst_reg, &resolved_src.operand) {
+                out.push(MirInst::Mov {
+                    dst: dst_reg,
+                    src: resolved_src.operand,
+                });
+            }
         }
         Reg::VReg(vreg) => {
             let alloc = get_alloc(vreg, allocations)?;
             if let Some(phys) = alloc.reg {
-                out.push(MirInst::Mov {
-                    dst: Reg::Phys(phys),
-                    src: resolved_src.operand,
-                });
+                let dst_reg = Reg::Phys(phys);
+                if !is_identity_move(dst_reg, &resolved_src.operand) {
+                    out.push(MirInst::Mov {
+                        dst: dst_reg,
+                        src: resolved_src.operand,
+                    });
+                }
             } else {
                 let offset = alloc
                     .stack_offset
@@ -930,6 +1454,10 @@ fn lower_mov_x86_64(
     }
 
     Ok(out)
+}
+
+fn is_identity_move(dst: Reg, src: &Operand) -> bool {
+    matches!(src, Operand::Reg(src_reg) if *src_reg == dst)
 }
 
 fn lower_load_stack_x86_64(
@@ -1413,6 +1941,51 @@ fn collect_phys_regs_for_cmp(lhs: Reg, rhs: &Operand) -> Vec<PhysReg> {
     regs
 }
 
+fn allocatable_arm64_registers() -> &'static [PhysReg] {
+    // Include argument registers to maximize coalescing on leaf functions,
+    // but keep scratch temporaries/reserved ABI registers out of allocation.
+    &[
+        PhysReg::X0,
+        PhysReg::X1,
+        PhysReg::X2,
+        PhysReg::X3,
+        PhysReg::X4,
+        PhysReg::X5,
+        PhysReg::X6,
+        PhysReg::X7,
+        PhysReg::X9,
+        PhysReg::X10,
+        PhysReg::X11,
+        PhysReg::X12,
+        PhysReg::X13,
+        PhysReg::X14,
+    ]
+}
+
+fn is_arm64_caller_saved(reg: PhysReg) -> bool {
+    matches!(
+        reg,
+        PhysReg::X0
+            | PhysReg::X1
+            | PhysReg::X2
+            | PhysReg::X3
+            | PhysReg::X4
+            | PhysReg::X5
+            | PhysReg::X6
+            | PhysReg::X7
+            | PhysReg::X8
+            | PhysReg::X9
+            | PhysReg::X10
+            | PhysReg::X11
+            | PhysReg::X12
+            | PhysReg::X13
+            | PhysReg::X14
+            | PhysReg::X15
+            | PhysReg::X16
+            | PhysReg::X17
+    )
+}
+
 fn allocatable_x86_64_registers() -> &'static [PhysReg] {
     &[
         PhysReg::RCX,
@@ -1640,7 +2213,7 @@ mod tests {
             linear_scan_allocate(&func, TargetArch::Amd64).expect("amd64 allocation should work");
         let asm = emit_x86_64_assembly(&allocation.function).expect("x86_64 emission failed");
 
-        assert!(asm.contains("pushq %rbp"));
+        assert!(asm.contains("movq $5"));
         assert!(asm.contains("ret"));
     }
 

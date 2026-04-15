@@ -820,6 +820,15 @@ fn emit_x86_64_sdiv(
     const RAX: u8 = 0;
     const R11: u8 = 11;
 
+    let mut rhs_code_override = None;
+    if let Operand::Reg(rhs_reg) = rhs {
+        let rhs_code = x86_64_reg_code(*rhs_reg)?;
+        if rhs_code == RAX && lhs_code != RAX {
+            emit_x86_64_mov(Reg::Phys(PhysReg::R11), &Operand::Reg(*rhs_reg), bytes)?;
+            rhs_code_override = Some(R11);
+        }
+    }
+
     if lhs_code != RAX {
         emit_x86_64_mov(Reg::Phys(PhysReg::RAX), &Operand::Reg(lhs), bytes)?;
     }
@@ -830,7 +839,7 @@ fn emit_x86_64_sdiv(
 
     match rhs {
         Operand::Reg(rhs_reg) => {
-            let rhs_code = x86_64_reg_code(*rhs_reg)?;
+            let rhs_code = rhs_code_override.unwrap_or(x86_64_reg_code(*rhs_reg)?);
             emit_x86_rex(bytes, true, 7, 0, rhs_code);
             bytes.push(0xF7);
             bytes.push(x86_modrm(0b11, 7, rhs_code));
