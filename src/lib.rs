@@ -1,5 +1,6 @@
 pub mod ir;
 pub mod lowering;
+pub mod minilang;
 pub mod mir;
 pub mod regalloc;
 
@@ -9,6 +10,12 @@ pub use ir::{
     constant_fold, dead_code_elimination, run_phase5_pipeline, simplify_cfg,
 };
 pub use lowering::{LoweringError, PhiCopy, PhiElimination, eliminate_phi_nodes, lower_il_to_mir};
+pub use minilang::{
+    BinaryOp as MiniBinaryOp, CodegenError as MiniCodegenError, Expr as MiniExpr,
+    FunctionAst as MiniFunctionAst, LexError as MiniLexError, MiniLangError,
+    ParseError as MiniParseError, Program as MiniProgram, Token as MiniToken,
+    TokenKind as MiniTokenKind, codegen_program, compile_source_to_ir, lex, parse, parse_source,
+};
 pub use mir::{
     Cond, EmitError, MirFunction, MirInst, Operand, PhysReg, Reg, TargetArch, emit_arm64_assembly,
     emit_assembly, emit_x86_64_assembly,

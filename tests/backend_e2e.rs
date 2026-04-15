@@ -8,6 +8,7 @@ mod macos_e2e {
 
     use king_compiler::ir::{Function, IrBuilder, Type, build_factorial_il, run_phase5_pipeline};
     use king_compiler::lowering::lower_il_to_mir;
+    use king_compiler::minilang::compile_source_to_ir;
     use king_compiler::mir::{TargetArch, emit_assembly};
     use king_compiler::regalloc::linear_scan_allocate;
 
@@ -114,6 +115,38 @@ mod macos_e2e {
             run_x86_64_binary(&phase5_factorial_bin)?,
             120,
             "phase5 factorial exit code mismatch"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn minilang_e2e_macos_x86_64() -> Result<(), Box<dyn Error>> {
+        let workdir = create_workdir()?;
+        let source = r#"
+            fn add2(a, b) = a + b;
+            fn crunch(x) = (x / 2) & 31;
+            fn main() = add2(crunch(84), 32);
+        "#;
+
+        let functions = compile_source_to_ir(source)?;
+        assert!(functions.iter().any(|function| function.name == "main"));
+
+        let mut asm_paths = Vec::new();
+        for function in &functions {
+            let asm = emit_amd64_asm(function)?;
+            let asm_path = write_file(&workdir, &format!("{}.s", function.name), &asm)?;
+            asm_paths.push(asm_path);
+        }
+
+        let source_paths: Vec<&Path> = asm_paths.iter().map(|path| path.as_path()).collect();
+        let output = workdir.join("minilang_bin");
+        compile_x86_64_macos(&source_paths, &output)?;
+
+        assert_eq!(
+            run_x86_64_binary(&output)?,
+            42,
+            "mini language program should return 42"
         );
 
         Ok(())
