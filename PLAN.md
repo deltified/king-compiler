@@ -1,5 +1,6 @@
 
-
+# COMPLETED:
+```
 ### Phase 0: Project Setup & Data Structures
 Before writing compiler logic, we must establish the data structures. If we were to use standard Rust references (`&` or `Box`) for the Control Flow Graph (CFG), we would enter "Borrow Checker Hell." 
 
@@ -11,10 +12,14 @@ Before writing compiler logic, we must establish the data structures. If we were
 3.  **Basic Types:**
     *   Define the `Type` enum (`I8`, `I32`, `I64`, `Ptr`, `Void`).
 
+```
+# TODO:
 ---
 
 ### Phase 1: Machine IR (MIR) & Assembly Emission
 **Goal:** Create a representation of actual CPU instructions and write them to a text file that a standard assembler (like `gcc` or `nasm`) can compile. *We are targeting a specific architecture here (e.g., x86_64).*
+
+Write this for arm64 first, then for x86_64.
 
 1.  **Define Physical Registers:** Create an enum for the target's actual registers (e.g., `RAX`, `RSP`, `RDI`).
 2.  **Define the MIR Instruction Enum:**
