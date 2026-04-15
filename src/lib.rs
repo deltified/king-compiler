@@ -2,6 +2,7 @@ pub mod ir;
 pub mod lowering;
 pub mod minilang;
 pub mod mir;
+pub mod object_emit;
 pub mod regalloc;
 
 pub use ir::{
@@ -20,6 +21,7 @@ pub use mir::{
     Cond, EmitError, MirFunction, MirInst, Operand, PhysReg, Reg, TargetArch, emit_arm64_assembly,
     emit_assembly, emit_x86_64_assembly,
 };
+pub use object_emit::{ObjectEmitError, emit_object_file};
 pub use regalloc::{
     AllocError, LinearScanAllocation, LiveInterval, VRegAllocation, compute_live_intervals,
     linear_scan_allocate,

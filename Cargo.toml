@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 slotmap = "1"
 petgraph = "0.8"
+object = { version = "0.37", features = ["write"] }

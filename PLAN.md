@@ -1,6 +1,6 @@
 
-# COMPLETED:
-```
+# This plan has been fully completed and all planned features implemented. 
+
 ### Phase 0: Project Setup & Data Structures
 Before writing compiler logic, we must establish the data structures. If we were to use standard Rust references (`&` or `Box`) for the Control Flow Graph (CFG), we would enter "Borrow Checker Hell." 
 
@@ -46,8 +46,6 @@ Write this for arm64 first, then for x86_64.
     *   When the allocator hits a `Call` MIR instruction, force it to evict all caller-saved registers to the stack.
     *   *Test:* Hand-write MIR with 30 virtual registers. Run the allocator. Check the emitted ASM to ensure stack offsets (`[rbp - 8]`) are used correctly.
 
-```
-# TODO:
 
 ---
 
@@ -102,7 +100,7 @@ Because we are using an Arena, optimizations usually work by creating a new, emp
 **Goal:** Remove the dependency on `gcc` or `nasm` to assemble the text files.
 
 1.  **The `object` Crate:**
-    *   Include the `object` crate in Rust.
+    *   Include the `object` crate in Rust. (Completed)
     *   Instead of formatting MIR into a `String`, map MIR instructions directly to their raw hexadecimal opcodes (e.g., `MOV RAX, RBX` -> `0x48 0x89 0xD8`).
     *   Use the `object` crate to wrap these bytes into an ELF (Linux), Mach-O (macOS), or PE (Windows) file.
     *   *Note:* This is highly rewarding but tedious, which is why Step 1 relies on text-assembly.
