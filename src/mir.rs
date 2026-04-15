@@ -231,95 +231,210 @@ pub fn emit_arm64_assembly(func: &MirFunction) -> Result<String, EmitError> {
     out.push_str(".p2align 2\n");
     out.push_str(&format!("{}:\n", func_symbol));
 
-    for inst in &func.instructions {
-        match inst {
-            MirInst::Label(label) => {
-                out.push_str(&format!("{}:\n", label));
-            }
-            MirInst::Mov { dst, src } => {
-                let dst = arm64_reg(*dst)?;
-                let src = arm64_operand(src)?;
-                out.push_str(&format!("    mov {}, {}\n", dst, src));
-            }
-            MirInst::Add { dst, lhs, rhs } => {
-                let dst = arm64_reg(*dst)?;
-                let lhs = arm64_reg(*lhs)?;
-                let rhs = arm64_operand(rhs)?;
-                out.push_str(&format!("    add {}, {}, {}\n", dst, lhs, rhs));
-            }
-            MirInst::Sub { dst, lhs, rhs } => {
-                let dst = arm64_reg(*dst)?;
-                let lhs = arm64_reg(*lhs)?;
-                let rhs = arm64_operand(rhs)?;
-                out.push_str(&format!("    sub {}, {}, {}\n", dst, lhs, rhs));
-            }
-            MirInst::And { dst, lhs, rhs } => {
-                let dst = arm64_reg(*dst)?;
-                let lhs = arm64_reg(*lhs)?;
-                let rhs = match rhs {
-                    Operand::Reg(reg) => arm64_reg(*reg)?,
-                    Operand::Imm(_) => {
-                        return Err(EmitError::new("arm64 and requires a register rhs operand"));
-                    }
-                };
-                out.push_str(&format!("    and {}, {}, {}\n", dst, lhs, rhs));
-            }
-            MirInst::Mul { dst, lhs, rhs } => {
-                let dst = arm64_reg(*dst)?;
-                let lhs = arm64_reg(*lhs)?;
-                let rhs = match rhs {
-                    Operand::Reg(reg) => arm64_reg(*reg)?,
-                    Operand::Imm(_) => {
-                        return Err(EmitError::new("arm64 mul requires a register rhs operand"));
-                    }
-                };
-                out.push_str(&format!("    mul {}, {}, {}\n", dst, lhs, rhs));
-            }
-            MirInst::Sdiv { dst, lhs, rhs } => {
-                let dst = arm64_reg(*dst)?;
-                let lhs = arm64_reg(*lhs)?;
-                let rhs = match rhs {
-                    Operand::Reg(reg) => arm64_reg(*reg)?,
-                    Operand::Imm(_) => {
-                        return Err(EmitError::new("arm64 sdiv requires a register rhs operand"));
-                    }
-                };
-                out.push_str(&format!("    sdiv {}, {}, {}\n", dst, lhs, rhs));
-            }
-            MirInst::Cmp { lhs, rhs } => {
-                let lhs = arm64_reg(*lhs)?;
-                let rhs = arm64_operand(rhs)?;
-                out.push_str(&format!("    cmp {}, {}\n", lhs, rhs));
-            }
-            MirInst::Push { .. } | MirInst::Pop { .. } => {
-                return Err(EmitError::new(
-                    "push/pop pseudo-instructions are not supported on arm64",
-                ));
-            }
-            MirInst::LoadStack { dst, offset } => {
-                let dst = arm64_reg(*dst)?;
-                out.push_str(&format!("    ldr {}, [x29, #-{}]\n", dst, offset));
-            }
-            MirInst::StoreStack { src, offset } => {
-                let src = arm64_reg(*src)?;
-                out.push_str(&format!("    str {}, [x29, #-{}]\n", src, offset));
-            }
-            MirInst::Jmp { label } => {
-                out.push_str(&format!("    b {}\n", label));
-            }
-            MirInst::JmpIf { cond, label } => {
-                out.push_str(&format!("    {} {}\n", arm64_cond(*cond), label));
-            }
-            MirInst::Call { symbol } => {
-                out.push_str(&format!("    bl {}\n", mangle_symbol(symbol)));
-            }
-            MirInst::Ret => {
-                out.push_str("    ret\n");
-            }
+    if let Some(stack_size) = detect_arm64_compact_pair_frame(&func.instructions) {
+        if stack_size == 16 {
+            out.push_str("    str x30, [sp, #-16]!\n");
+        } else {
+            out.push_str(&format!("    stp x29, x30, [sp, #-{}]!\n", stack_size));
         }
+
+        for inst in &func.instructions[5..func.instructions.len() - 4] {
+            emit_arm64_instruction(inst, &mut out)?;
+        }
+
+        if stack_size == 16 {
+            out.push_str("    ldr x30, [sp], #16\n");
+        } else {
+            out.push_str(&format!("    ldp x29, x30, [sp], #{}\n", stack_size));
+        }
+        out.push_str("    ret\n");
+        return Ok(out);
+    }
+
+    for inst in &func.instructions {
+        emit_arm64_instruction(inst, &mut out)?;
     }
 
     Ok(out)
+}
+
+fn detect_arm64_compact_pair_frame(instructions: &[MirInst]) -> Option<i64> {
+    if instructions.len() < 9 {
+        return None;
+    }
+
+    let stack_size = match &instructions[0..5] {
+        [
+            MirInst::Mov {
+                dst: Reg::Phys(PhysReg::X16),
+                src: Operand::Reg(Reg::Phys(PhysReg::X29)),
+            },
+            MirInst::Sub {
+                dst: Reg::Phys(PhysReg::SP),
+                lhs: Reg::Phys(PhysReg::SP),
+                rhs: Operand::Imm(stack_sub),
+            },
+            MirInst::Add {
+                dst: Reg::Phys(PhysReg::X29),
+                lhs: Reg::Phys(PhysReg::SP),
+                rhs: Operand::Imm(stack_add),
+            },
+            MirInst::StoreStack {
+                src: Reg::Phys(PhysReg::X16),
+                offset: saved_fp_offset,
+            },
+            MirInst::StoreStack {
+                src: Reg::Phys(PhysReg::X30),
+                offset: saved_lr_offset,
+            },
+        ] => {
+            if stack_sub != stack_add {
+                return None;
+            }
+            if *stack_sub <= 0 {
+                return None;
+            }
+            if *saved_fp_offset + 8 != *saved_lr_offset {
+                return None;
+            }
+            if i64::from(*saved_lr_offset) != *stack_sub {
+                return None;
+            }
+            *stack_sub
+        }
+        _ => return None,
+    };
+
+    let epilogue_start = instructions.len() - 4;
+    match &instructions[epilogue_start..] {
+        [
+            MirInst::LoadStack {
+                dst: Reg::Phys(PhysReg::X30),
+                offset: saved_lr_offset,
+            },
+            MirInst::LoadStack {
+                dst: Reg::Phys(PhysReg::X29),
+                offset: saved_fp_offset,
+            },
+            MirInst::Add {
+                dst: Reg::Phys(PhysReg::SP),
+                lhs: Reg::Phys(PhysReg::SP),
+                rhs: Operand::Imm(epilogue_stack),
+            },
+            MirInst::Ret,
+        ] => {
+            if *saved_fp_offset + 8 != *saved_lr_offset {
+                return None;
+            }
+            if i64::from(*saved_lr_offset) != stack_size {
+                return None;
+            }
+            if *epilogue_stack != stack_size {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+
+    // Only compact this frame shape when there are no interior stack accesses.
+    if instructions[5..epilogue_start]
+        .iter()
+        .any(|inst| matches!(inst, MirInst::LoadStack { .. } | MirInst::StoreStack { .. }))
+    {
+        return None;
+    }
+
+    Some(stack_size)
+}
+
+fn emit_arm64_instruction(inst: &MirInst, out: &mut String) -> Result<(), EmitError> {
+    match inst {
+        MirInst::Label(label) => {
+            out.push_str(&format!("{}:\n", label));
+        }
+        MirInst::Mov { dst, src } => {
+            let dst = arm64_reg(*dst)?;
+            let src = arm64_operand(src)?;
+            out.push_str(&format!("    mov {}, {}\n", dst, src));
+        }
+        MirInst::Add { dst, lhs, rhs } => {
+            let dst = arm64_reg(*dst)?;
+            let lhs = arm64_reg(*lhs)?;
+            let rhs = arm64_operand(rhs)?;
+            out.push_str(&format!("    add {}, {}, {}\n", dst, lhs, rhs));
+        }
+        MirInst::Sub { dst, lhs, rhs } => {
+            let dst = arm64_reg(*dst)?;
+            let lhs = arm64_reg(*lhs)?;
+            let rhs = arm64_operand(rhs)?;
+            out.push_str(&format!("    sub {}, {}, {}\n", dst, lhs, rhs));
+        }
+        MirInst::And { dst, lhs, rhs } => {
+            let dst = arm64_reg(*dst)?;
+            let lhs = arm64_reg(*lhs)?;
+            let rhs = match rhs {
+                Operand::Reg(reg) => arm64_reg(*reg)?,
+                Operand::Imm(_) => {
+                    return Err(EmitError::new("arm64 and requires a register rhs operand"));
+                }
+            };
+            out.push_str(&format!("    and {}, {}, {}\n", dst, lhs, rhs));
+        }
+        MirInst::Mul { dst, lhs, rhs } => {
+            let dst = arm64_reg(*dst)?;
+            let lhs = arm64_reg(*lhs)?;
+            let rhs = match rhs {
+                Operand::Reg(reg) => arm64_reg(*reg)?,
+                Operand::Imm(_) => {
+                    return Err(EmitError::new("arm64 mul requires a register rhs operand"));
+                }
+            };
+            out.push_str(&format!("    mul {}, {}, {}\n", dst, lhs, rhs));
+        }
+        MirInst::Sdiv { dst, lhs, rhs } => {
+            let dst = arm64_reg(*dst)?;
+            let lhs = arm64_reg(*lhs)?;
+            let rhs = match rhs {
+                Operand::Reg(reg) => arm64_reg(*reg)?,
+                Operand::Imm(_) => {
+                    return Err(EmitError::new("arm64 sdiv requires a register rhs operand"));
+                }
+            };
+            out.push_str(&format!("    sdiv {}, {}, {}\n", dst, lhs, rhs));
+        }
+        MirInst::Cmp { lhs, rhs } => {
+            let lhs = arm64_reg(*lhs)?;
+            let rhs = arm64_operand(rhs)?;
+            out.push_str(&format!("    cmp {}, {}\n", lhs, rhs));
+        }
+        MirInst::Push { .. } | MirInst::Pop { .. } => {
+            return Err(EmitError::new(
+                "push/pop pseudo-instructions are not supported on arm64",
+            ));
+        }
+        MirInst::LoadStack { dst, offset } => {
+            let dst = arm64_reg(*dst)?;
+            out.push_str(&format!("    ldr {}, [x29, #-{}]\n", dst, offset));
+        }
+        MirInst::StoreStack { src, offset } => {
+            let src = arm64_reg(*src)?;
+            out.push_str(&format!("    str {}, [x29, #-{}]\n", src, offset));
+        }
+        MirInst::Jmp { label } => {
+            out.push_str(&format!("    b {}\n", label));
+        }
+        MirInst::JmpIf { cond, label } => {
+            out.push_str(&format!("    {} {}\n", arm64_cond(*cond), label));
+        }
+        MirInst::Call { symbol } => {
+            out.push_str(&format!("    bl {}\n", mangle_symbol(symbol)));
+        }
+        MirInst::Ret => {
+            out.push_str("    ret\n");
+        }
+    }
+
+    Ok(())
 }
 
 pub fn emit_x86_64_assembly(func: &MirFunction) -> Result<String, EmitError> {
