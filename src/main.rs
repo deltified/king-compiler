@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use king_compiler::{
     compile_source_to_ir, emit_assembly, linear_scan_allocate, lower_il_to_mir, Function,
-    TargetArch,
+    TargetArch, run_phase5_pipeline,
 };
 
 fn main() {
@@ -75,7 +75,8 @@ fn emit_program_assembly(
     let mut chunks = Vec::with_capacity(functions.len());
 
     for function in functions {
-        let mir = lower_il_to_mir(function, target)?;
+        let optimized = run_phase5_pipeline(function.clone());
+        let mir = lower_il_to_mir(&optimized, target)?;
         let allocated = linear_scan_allocate(&mir, target)?;
         let assembly = emit_assembly(&allocated.function, target)?;
         chunks.push(assembly.trim_end_matches('\n').to_string());
